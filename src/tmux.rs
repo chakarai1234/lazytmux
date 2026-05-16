@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
+use std::env;
+use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use anyhow::{anyhow, Context, Result};
@@ -8,6 +11,31 @@ use anyhow::{anyhow, Context, Result};
 const SEP: char = '\u{1f}';
 const TMUX_FORMAT: &str = "#{session_id}\u{1f}#{session_name}\u{1f}#{session_attached}\u{1f}#{session_created}\u{1f}#{session_windows}\u{1f}#{window_id}\u{1f}#{window_index}\u{1f}#{window_name}\u{1f}#{window_active}\u{1f}#{window_panes}\u{1f}#{window_layout}\u{1f}#{window_flags}\u{1f}#{pane_id}\u{1f}#{pane_index}\u{1f}#{pane_active}\u{1f}#{pane_current_command}\u{1f}#{pane_current_path}\u{1f}#{pane_title}\u{1f}#{pane_left}\u{1f}#{pane_top}\u{1f}#{pane_width}\u{1f}#{pane_height}\u{1f}#{pane_pid}\u{1f}#{pane_dead}\u{1f}#{pane_in_mode}";
 const FIELD_COUNT: usize = 25;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TmuxServer {
+    Default,
+    Socket(PathBuf),
+}
+
+impl Default for TmuxServer {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+impl TmuxServer {
+    fn from_tmux_env() -> Option<Self> {
+        let value = env::var_os("TMUX")?;
+        let value = value.to_string_lossy();
+        let socket = value.split(',').next().unwrap_or_default();
+        if socket.is_empty() {
+            None
+        } else {
+            Some(Self::Socket(PathBuf::from(socket)))
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TmuxState {
@@ -34,6 +62,7 @@ impl TmuxState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Session {
+    pub server: TmuxServer,
     pub id: String,
     pub name: String,
     pub attached: bool,
@@ -74,34 +103,43 @@ pub struct Pane {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TmuxTarget {
+    server: TmuxServer,
     pub session_id: String,
     pub window_id: Option<String>,
     pub pane_id: Option<String>,
 }
 
 impl TmuxTarget {
-    pub fn session(session_id: impl Into<String>) -> Self {
+    pub fn session_on(session_id: impl Into<String>, server: TmuxServer) -> Self {
         Self {
+            server,
             session_id: session_id.into(),
             window_id: None,
             pane_id: None,
         }
     }
 
-    pub fn window(session_id: impl Into<String>, window_id: impl Into<String>) -> Self {
+    pub fn window_on(
+        session_id: impl Into<String>,
+        window_id: impl Into<String>,
+        server: TmuxServer,
+    ) -> Self {
         Self {
+            server,
             session_id: session_id.into(),
             window_id: Some(window_id.into()),
             pane_id: None,
         }
     }
 
-    pub fn pane(
+    pub fn pane_on(
         session_id: impl Into<String>,
         window_id: impl Into<String>,
         pane_id: impl Into<String>,
+        server: TmuxServer,
     ) -> Self {
         Self {
+            server,
             session_id: session_id.into(),
             window_id: Some(window_id.into()),
             pane_id: Some(pane_id.into()),
@@ -115,6 +153,10 @@ impl TmuxTarget {
             (None, None) => self.session_id.clone(),
         }
     }
+
+    fn server(&self) -> &TmuxServer {
+        &self.server
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -124,47 +166,62 @@ pub enum SplitDirection {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct TmuxClient;
+pub struct TmuxClient {
+    server: TmuxServer,
+}
 
 impl TmuxClient {
-    pub fn load(&self) -> Result<TmuxState> {
-        let output = match tmux_output(["list-panes", "-a", "-F", TMUX_FORMAT]) {
-            Ok(output) => output,
-            Err(error) if is_not_found(&error) => {
-                return Err(anyhow!("tmux executable was not found in PATH"));
-            }
-            Err(error) => return Err(error),
-        };
+    pub fn load(&mut self) -> Result<TmuxState> {
+        for server in candidate_servers(&self.server) {
+            let output = match tmux_output_on(&server, ["list-panes", "-a", "-F", TMUX_FORMAT]) {
+                Ok(output) => output,
+                Err(error) if is_not_found(&error) => {
+                    return Err(anyhow!("tmux executable was not found in PATH"));
+                }
+                Err(error) => return Err(error),
+            };
 
-        if !output.status.success() {
+            if output.status.success() {
+                self.server = server.clone();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut state = parse_list_panes(&stdout, server);
+                self.capture_visible_content(&mut state);
+                if state.sessions.is_empty() {
+                    state.notice =
+                        Some("No tmux sessions found. Press n to create a session.".into());
+                }
+                return Ok(state);
+            }
+
             let message = output_message(&output);
-            if message.contains("no server running") || message.contains("failed to connect") {
-                return Ok(TmuxState {
-                    sessions: Vec::new(),
-                    notice: Some("No tmux server is running. Press n to create a session.".into()),
-                });
+            if is_no_server_message(&message) {
+                continue;
             }
             return Err(anyhow!("tmux list-panes failed: {message}"));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut state = parse_list_panes(&stdout);
-        self.capture_visible_content(&mut state);
-        if state.sessions.is_empty() {
-            state.notice = Some("No tmux sessions found. Press n to create a session.".into());
-        }
-        Ok(state)
+        self.server = TmuxServer::Default;
+        Ok(TmuxState {
+            sessions: Vec::new(),
+            notice: Some("No tmux server is running. Press n to create a session.".into()),
+        })
     }
 
     pub fn switch_to_target(&self, target: &TmuxTarget) -> Result<()> {
         self.select_target(target)?;
-        run_tmux(["switch-client", "-t", target.session_id.as_str()])
+        run_tmux_on(
+            target.server(),
+            ["switch-client", "-t", target.session_id.as_str()],
+        )
     }
 
     pub fn attach_to_target(&self, target: &TmuxTarget) -> Result<()> {
         self.select_target(target)?;
-        let status = Command::new("tmux")
-            .args(["attach-session", "-t", target.session_id.as_str()])
+        let mut command = tmux_command(
+            target.server(),
+            ["attach-session", "-t", target.session_id.as_str()],
+        );
+        let status = command
             .status()
             .context("failed to run tmux attach-session")?;
 
@@ -176,11 +233,14 @@ impl TmuxClient {
     }
 
     pub fn create_session(&self, name: &str) -> Result<()> {
-        run_tmux(["new-session", "-d", "-s", name])
+        run_tmux_on(&self.server, ["new-session", "-d", "-s", name])
     }
 
     pub fn create_window(&self, session_id: &str, name: &str) -> Result<()> {
-        run_tmux(["new-window", "-d", "-t", session_id, "-n", name])
+        run_tmux_on(
+            &self.server,
+            ["new-window", "-d", "-t", session_id, "-n", name],
+        )
     }
 
     pub fn split_pane(&self, pane_id: &str, direction: SplitDirection) -> Result<()> {
@@ -188,51 +248,51 @@ impl TmuxClient {
             SplitDirection::Horizontal => "-h",
             SplitDirection::Vertical => "-v",
         };
-        run_tmux(["split-window", flag, "-t", pane_id])
+        run_tmux_on(&self.server, ["split-window", flag, "-t", pane_id])
     }
 
     pub fn rename_session(&self, session_id: &str, name: &str) -> Result<()> {
-        run_tmux(["rename-session", "-t", session_id, name])
+        run_tmux_on(&self.server, ["rename-session", "-t", session_id, name])
     }
 
     pub fn rename_window(&self, window_id: &str, name: &str) -> Result<()> {
-        run_tmux(["rename-window", "-t", window_id, name])
+        run_tmux_on(&self.server, ["rename-window", "-t", window_id, name])
     }
 
     pub fn rename_pane(&self, pane_id: &str, title: &str) -> Result<()> {
-        run_tmux(["select-pane", "-t", pane_id, "-T", title])
+        run_tmux_on(&self.server, ["select-pane", "-t", pane_id, "-T", title])
     }
 
     pub fn kill_session(&self, session_id: &str) -> Result<()> {
-        run_tmux(["kill-session", "-t", session_id])
+        run_tmux_on(&self.server, ["kill-session", "-t", session_id])
     }
 
     pub fn kill_window(&self, window_id: &str) -> Result<()> {
-        run_tmux(["kill-window", "-t", window_id])
+        run_tmux_on(&self.server, ["kill-window", "-t", window_id])
     }
 
     pub fn kill_pane(&self, pane_id: &str) -> Result<()> {
-        run_tmux(["kill-pane", "-t", pane_id])
+        run_tmux_on(&self.server, ["kill-pane", "-t", pane_id])
     }
 
     pub fn toggle_zoom(&self, pane_id: &str) -> Result<()> {
-        run_tmux(["resize-pane", "-Z", "-t", pane_id])
+        run_tmux_on(&self.server, ["resize-pane", "-Z", "-t", pane_id])
     }
 
     pub fn detach_client(&self) -> Result<()> {
-        run_tmux(["detach-client"])
+        run_tmux_on(&self.server, ["detach-client"])
     }
 
     pub fn run_args(&self, args: &[String]) -> Result<()> {
-        run_tmux_owned(args)
+        run_tmux_owned_on(&self.server, args)
     }
 
     fn select_target(&self, target: &TmuxTarget) -> Result<()> {
         if let Some(window_id) = &target.window_id {
-            run_tmux(["select-window", "-t", window_id.as_str()])?;
+            run_tmux_on(target.server(), ["select-window", "-t", window_id.as_str()])?;
         }
         if let Some(pane_id) = &target.pane_id {
-            run_tmux(["select-pane", "-t", pane_id.as_str()])?;
+            run_tmux_on(target.server(), ["select-pane", "-t", pane_id.as_str()])?;
         }
         Ok(())
     }
@@ -244,13 +304,13 @@ impl TmuxClient {
             .flat_map(|session| &mut session.windows)
             .flat_map(|window| &mut window.panes)
         {
-            pane.content = capture_pane_content(&pane.id)
+            pane.content = capture_pane_content(&self.server, &pane.id)
                 .unwrap_or_else(|error| format!("Unable to capture pane content: {error}"));
         }
     }
 }
 
-fn parse_list_panes(output: &str) -> TmuxState {
+fn parse_list_panes(output: &str, server: TmuxServer) -> TmuxState {
     let mut sessions: BTreeMap<String, Session> = BTreeMap::new();
 
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
@@ -266,6 +326,7 @@ fn parse_list_panes(output: &str) -> TmuxState {
         let session = sessions
             .entry(session_id.clone())
             .or_insert_with(|| Session {
+                server: server.clone(),
                 id: session_id.clone(),
                 name: fields[1].to_string(),
                 attached: parse_bool(fields[2]),
@@ -335,23 +396,163 @@ fn parse_bool(value: &str) -> bool {
     matches!(value, "1" | "true" | "yes" | "on")
 }
 
-fn tmux_output<I, S>(args: I) -> Result<Output>
+fn candidate_servers(active: &TmuxServer) -> Vec<TmuxServer> {
+    let mut servers = Vec::new();
+    if !matches!(active, TmuxServer::Default) {
+        push_unique_server(&mut servers, active.clone());
+    }
+    if let Some(server) = TmuxServer::from_tmux_env() {
+        push_unique_server(&mut servers, server);
+    }
+    push_unique_server(&mut servers, TmuxServer::Default);
+    for socket in discover_socket_paths() {
+        push_unique_server(&mut servers, TmuxServer::Socket(socket));
+    }
+    servers
+}
+
+fn push_unique_server(servers: &mut Vec<TmuxServer>, server: TmuxServer) {
+    if !servers.contains(&server) {
+        servers.push(server);
+    }
+}
+
+fn discover_socket_paths() -> Vec<PathBuf> {
+    let mut sockets = Vec::new();
+    for dir in socket_dirs() {
+        collect_socket_paths(&dir, &mut sockets);
+    }
+    sockets.sort();
+    sockets.dedup();
+    sockets
+}
+
+fn socket_dirs() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    push_unique_path(&mut roots, env::temp_dir());
+    push_unique_path(&mut roots, PathBuf::from("/tmp"));
+    push_unique_path(&mut roots, PathBuf::from("/private/tmp"));
+    if let Some(path) = env::var_os("TMUX_TMPDIR") {
+        push_unique_path(&mut roots, PathBuf::from(path));
+    }
+    if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
+        push_unique_path(&mut roots, PathBuf::from(path));
+    }
+    let uid = current_uid();
+    if let Some(uid) = &uid {
+        push_unique_path(&mut roots, PathBuf::from(format!("/run/user/{uid}")));
+    }
+
+    let Some(uid) = uid else {
+        return roots;
+    };
+
+    roots
+        .into_iter()
+        .flat_map(|root| [root.join(format!("tmux-{uid}")), root])
+        .collect()
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.contains(&path) {
+        paths.push(path);
+    }
+}
+
+fn current_uid() -> Option<String> {
+    if let Some(uid) = env::var_os("UID").and_then(valid_uid) {
+        return Some(uid);
+    }
+
+    let output = Command::new("id").arg("-u").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    valid_uid(OsString::from(
+        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+    ))
+}
+
+fn valid_uid(value: OsString) -> Option<String> {
+    let value = value.to_string_lossy().trim().to_string();
+    if !value.is_empty() && value.chars().all(|character| character.is_ascii_digit()) {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn collect_socket_paths(dir: &Path, sockets: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if is_socket(&file_type) {
+            sockets.push(entry.path());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_socket(file_type: &fs::FileType) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    file_type.is_socket()
+}
+
+#[cfg(not(unix))]
+fn is_socket(_: &fs::FileType) -> bool {
+    false
+}
+
+fn tmux_command<I, S>(server: &TmuxServer, args: I) -> Command
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    Command::new("tmux")
-        .args(args)
+    let mut command = Command::new("tmux");
+    if matches!(server, TmuxServer::Default) {
+        command.env_remove("TMUX");
+    }
+    command.args(tmux_command_args(server, args));
+    command
+}
+
+fn tmux_command_args<I, S>(server: &TmuxServer, args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command_args = Vec::new();
+    if let TmuxServer::Socket(socket) = server {
+        command_args.push(OsString::from("-S"));
+        command_args.push(socket.as_os_str().to_os_string());
+    }
+    command_args.extend(args.into_iter().map(|arg| arg.as_ref().to_os_string()));
+    command_args
+}
+
+fn tmux_output_on<I, S>(server: &TmuxServer, args: I) -> Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    tmux_command(server, args)
         .output()
         .context("failed to run tmux")
 }
 
-fn run_tmux<I, S>(args: I) -> Result<()>
+fn run_tmux_on<I, S>(server: &TmuxServer, args: I) -> Result<()>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = tmux_output(args)?;
+    let output = tmux_output_on(server, args)?;
     if output.status.success() {
         Ok(())
     } else {
@@ -359,8 +560,8 @@ where
     }
 }
 
-fn run_tmux_owned(args: &[String]) -> Result<()> {
-    let output = tmux_output(args)?;
+fn run_tmux_owned_on(server: &TmuxServer, args: &[String]) -> Result<()> {
+    let output = tmux_output_on(server, args)?;
     if output.status.success() {
         Ok(())
     } else {
@@ -368,8 +569,8 @@ fn run_tmux_owned(args: &[String]) -> Result<()> {
     }
 }
 
-fn capture_pane_content(pane_id: &str) -> Result<String> {
-    let output = tmux_output(["capture-pane", "-p", "-t", pane_id])?;
+fn capture_pane_content(server: &TmuxServer, pane_id: &str) -> Result<String> {
+    let output = tmux_output_on(server, ["capture-pane", "-p", "-t", pane_id])?;
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         Ok(normalize_captured_content(&stdout))
@@ -398,6 +599,14 @@ fn output_message(output: &Output) -> String {
         return stderr;
     }
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn is_no_server_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("no server running")
+        || message.contains("failed to connect")
+        || message.contains("error connecting")
+        || message.contains("no such file or directory")
 }
 
 fn is_not_found(error: &anyhow::Error) -> bool {
@@ -442,12 +651,42 @@ mod tests {
         ]
         .join("\u{1f}");
 
-        let state = parse_list_panes(&row);
+        let server = TmuxServer::Socket(PathBuf::from("/tmp/tmux-1000/default"));
+        let state = parse_list_panes(&row, server.clone());
 
         assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].server, server);
         assert_eq!(state.sessions[0].windows.len(), 1);
         assert_eq!(state.sessions[0].windows[0].panes.len(), 1);
         assert_eq!(state.sessions[0].windows[0].panes[0].command, "nvim");
+    }
+
+    #[test]
+    fn prefixes_socket_server_args() {
+        let args = tmux_command_args(
+            &TmuxServer::Socket(PathBuf::from("/tmp/tmux-1000/default")),
+            ["list-panes", "-a"],
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("-S"),
+                OsString::from("/tmp/tmux-1000/default"),
+                OsString::from("list-panes"),
+                OsString::from("-a"),
+            ]
+        );
+    }
+
+    #[test]
+    fn leaves_default_server_args_unprefixed() {
+        let args = tmux_command_args(&TmuxServer::Default, ["list-panes", "-a"]);
+
+        assert_eq!(
+            args,
+            vec![OsString::from("list-panes"), OsString::from("-a")]
+        );
     }
 
     #[test]

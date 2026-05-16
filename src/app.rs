@@ -110,7 +110,7 @@ pub struct App {
 impl App {
     pub fn new(refresh_interval: Duration) -> Self {
         Self {
-            client: TmuxClient,
+            client: TmuxClient::default(),
             state: TmuxState::default(),
             items: Vec::new(),
             selected: 0,
@@ -804,7 +804,7 @@ fn session_item(session: &Session) -> TreeItem {
             session.window_count.unwrap_or(session.windows.len()),
             if session.attached { ", attached" } else { "" }
         ),
-        target: TmuxTarget::session(session.id.clone()),
+        target: TmuxTarget::session_on(session.id.clone(), session.server.clone()),
         rename_value: session.name.clone(),
         details: vec![
             ("Type".into(), "Session".into()),
@@ -865,7 +865,11 @@ fn window_item(session: &Session, window: &Window) -> TreeItem {
             window.pane_count.unwrap_or(window.panes.len()),
             window.flags
         ),
-        target: TmuxTarget::window(session.id.clone(), window.id.clone()),
+        target: TmuxTarget::window_on(
+            session.id.clone(),
+            window.id.clone(),
+            session.server.clone(),
+        ),
         rename_value: window.name.clone(),
         details: vec![
             ("Type".into(), "Window".into()),
@@ -916,7 +920,12 @@ fn pane_item(session: &Session, window: &Window, pane: &Pane) -> TreeItem {
         } else {
             format!("{} - {}", pane.command, pane.path)
         },
-        target: TmuxTarget::pane(session.id.clone(), window.id.clone(), pane.id.clone()),
+        target: TmuxTarget::pane_on(
+            session.id.clone(),
+            window.id.clone(),
+            pane.id.clone(),
+            session.server.clone(),
+        ),
         rename_value: if pane.title.is_empty() {
             name.clone()
         } else {
