@@ -12,16 +12,11 @@ const SEP: char = '\u{1f}';
 const TMUX_FORMAT: &str = "#{session_id}\u{1f}#{session_name}\u{1f}#{session_attached}\u{1f}#{session_created}\u{1f}#{session_windows}\u{1f}#{window_id}\u{1f}#{window_index}\u{1f}#{window_name}\u{1f}#{window_active}\u{1f}#{window_panes}\u{1f}#{window_layout}\u{1f}#{window_flags}\u{1f}#{pane_id}\u{1f}#{pane_index}\u{1f}#{pane_active}\u{1f}#{pane_current_command}\u{1f}#{pane_current_path}\u{1f}#{pane_title}\u{1f}#{pane_left}\u{1f}#{pane_top}\u{1f}#{pane_width}\u{1f}#{pane_height}\u{1f}#{pane_pid}\u{1f}#{pane_dead}\u{1f}#{pane_in_mode}";
 const FIELD_COUNT: usize = 25;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum TmuxServer {
+    #[default]
     Default,
     Socket(PathBuf),
-}
-
-impl Default for TmuxServer {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 impl TmuxServer {
