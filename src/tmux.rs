@@ -8,9 +8,36 @@ use std::process::{Command, Output};
 
 use anyhow::{anyhow, Context, Result};
 
-const SEP: char = '\u{1f}';
-const TMUX_FORMAT: &str = "#{session_id}\u{1f}#{session_name}\u{1f}#{session_attached}\u{1f}#{session_created}\u{1f}#{session_windows}\u{1f}#{window_id}\u{1f}#{window_index}\u{1f}#{window_name}\u{1f}#{window_active}\u{1f}#{window_panes}\u{1f}#{window_layout}\u{1f}#{window_flags}\u{1f}#{pane_id}\u{1f}#{pane_index}\u{1f}#{pane_active}\u{1f}#{pane_current_command}\u{1f}#{pane_current_path}\u{1f}#{pane_title}\u{1f}#{pane_left}\u{1f}#{pane_top}\u{1f}#{pane_width}\u{1f}#{pane_height}\u{1f}#{pane_pid}\u{1f}#{pane_dead}\u{1f}#{pane_in_mode}";
-const FIELD_COUNT: usize = 25;
+const PRIMARY_SEP: char = '\u{1f}';
+const FALLBACK_SEP: char = '\t';
+const REQUIRED_FIELD_COUNT: usize = 23;
+const TMUX_FIELDS: [&str; 25] = [
+    "session_id",
+    "session_name",
+    "session_attached",
+    "session_created",
+    "session_windows",
+    "window_id",
+    "window_index",
+    "window_name",
+    "window_active",
+    "window_panes",
+    "window_layout",
+    "window_flags",
+    "pane_id",
+    "pane_index",
+    "pane_active",
+    "pane_current_command",
+    "pane_current_path",
+    "pane_title",
+    "pane_left",
+    "pane_top",
+    "pane_width",
+    "pane_height",
+    "pane_pid",
+    "pane_dead",
+    "pane_in_mode",
+];
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum TmuxServer {
@@ -170,32 +197,23 @@ impl TmuxClient {
         let mut empty_server = None;
 
         for server in candidate_servers(&self.server) {
-            let output = match tmux_output_on(&server, ["list-panes", "-a", "-F", TMUX_FORMAT]) {
-                Ok(output) => output,
+            let mut state = match load_state_from_server(&server) {
+                Ok(ServerLoad::State(state)) => state,
+                Ok(ServerLoad::Unavailable) => continue,
                 Err(error) if is_not_found(&error) => {
                     return Err(anyhow!("tmux executable was not found in PATH"));
                 }
                 Err(error) => return Err(error),
             };
 
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let mut state = parse_list_panes(&stdout, server.clone());
-                if state.sessions.is_empty() {
-                    empty_server.get_or_insert(server);
-                    continue;
-                }
-
-                self.server = server.clone();
-                self.capture_visible_content(&mut state);
-                return Ok(state);
-            }
-
-            let message = output_message(&output);
-            if is_no_server_message(&message) {
+            if state.sessions.is_empty() {
+                empty_server.get_or_insert(server);
                 continue;
             }
-            return Err(anyhow!("tmux list-panes failed: {message}"));
+
+            self.server = server.clone();
+            self.capture_visible_content(&mut state);
+            return Ok(state);
         }
 
         if let Some(server) = empty_server {
@@ -316,12 +334,57 @@ impl TmuxClient {
     }
 }
 
-fn parse_list_panes(output: &str, server: TmuxServer) -> TmuxState {
+enum ServerLoad {
+    State(TmuxState),
+    Unavailable,
+}
+
+fn load_state_from_server(server: &TmuxServer) -> Result<ServerLoad> {
+    let mut unparsed_output = false;
+
+    for separator in [PRIMARY_SEP, FALLBACK_SEP] {
+        let format = tmux_format(separator);
+        let output = tmux_output_on(server, ["list-panes", "-a", "-F", format.as_str()])?;
+        if !output.status.success() {
+            let message = output_message(&output);
+            if is_no_server_message(&message) {
+                return Ok(ServerLoad::Unavailable);
+            }
+            return Err(anyhow!("tmux list-panes failed: {message}"));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let state = parse_list_panes(&stdout, server.clone(), separator);
+        if !state.sessions.is_empty() || stdout.trim().is_empty() {
+            return Ok(ServerLoad::State(state));
+        }
+        unparsed_output = true;
+    }
+
+    if unparsed_output {
+        Err(anyhow!(
+            "tmux list-panes returned data, but lazytmux could not parse it"
+        ))
+    } else {
+        Ok(ServerLoad::Unavailable)
+    }
+}
+
+fn tmux_format(separator: char) -> String {
+    let separator = separator.to_string();
+    TMUX_FIELDS
+        .iter()
+        .map(|field| format!("#{{{field}}}"))
+        .collect::<Vec<_>>()
+        .join(&separator)
+}
+
+fn parse_list_panes(output: &str, server: TmuxServer, separator: char) -> TmuxState {
     let mut sessions: BTreeMap<String, Session> = BTreeMap::new();
 
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
-        let fields: Vec<&str> = line.split(SEP).collect();
-        if fields.len() < FIELD_COUNT {
+        let fields: Vec<&str> = line.split(separator).collect();
+        if fields.len() < REQUIRED_FIELD_COUNT {
             continue;
         }
 
@@ -373,8 +436,8 @@ fn parse_list_panes(output: &str, server: TmuxServer) -> TmuxState {
                 width: fields[20].parse().ok(),
                 height: fields[21].parse().ok(),
                 pid: fields[22].to_string(),
-                dead: parse_bool(fields[23]),
-                in_mode: parse_bool(fields[24]),
+                dead: fields.get(23).copied().is_some_and(parse_bool),
+                in_mode: fields.get(24).copied().is_some_and(parse_bool),
                 content: String::new(),
             });
         }
@@ -435,6 +498,11 @@ fn discover_socket_paths() -> Vec<PathBuf> {
 
 fn socket_dirs() -> Vec<PathBuf> {
     let mut roots = Vec::new();
+    let tmux_env_socket = TmuxServer::from_tmux_env().and_then(|server| match server {
+        TmuxServer::Socket(socket) => socket.parent().map(Path::to_path_buf),
+        TmuxServer::Default => None,
+    });
+
     push_unique_path(&mut roots, env::temp_dir());
     push_unique_path(&mut roots, PathBuf::from("/tmp"));
     push_unique_path(&mut roots, PathBuf::from("/private/tmp"));
@@ -459,6 +527,9 @@ fn socket_dirs() -> Vec<PathBuf> {
         }
         push_unique_path(&mut dirs, root.join("tmux"));
         collect_tmux_dirs(&root, &mut dirs);
+    }
+    if let Some(dir) = tmux_env_socket {
+        push_unique_path(&mut dirs, dir);
     }
     dirs
 }
@@ -502,7 +573,7 @@ fn collect_socket_paths(dir: &Path, sockets: &mut Vec<PathBuf>) {
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        if is_socket(&file_type) {
+        if is_socket_candidate(&file_type) {
             sockets.push(entry.path());
         }
     }
@@ -530,14 +601,14 @@ fn is_tmux_dir(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn is_socket(file_type: &fs::FileType) -> bool {
+fn is_socket_candidate(file_type: &fs::FileType) -> bool {
     use std::os::unix::fs::FileTypeExt;
 
-    file_type.is_socket()
+    file_type.is_socket() || file_type.is_symlink() || file_type.is_file()
 }
 
 #[cfg(not(unix))]
-fn is_socket(_: &fs::FileType) -> bool {
+fn is_socket_candidate(_: &fs::FileType) -> bool {
     false
 }
 
@@ -680,15 +751,53 @@ mod tests {
             "0",
             "0",
         ]
-        .join("\u{1f}");
+        .join(&PRIMARY_SEP.to_string());
 
         let server = TmuxServer::Socket(PathBuf::from("/tmp/tmux-1000/default"));
-        let state = parse_list_panes(&row, server.clone());
+        let state = parse_list_panes(&row, server.clone(), PRIMARY_SEP);
 
         assert_eq!(state.sessions.len(), 1);
         assert_eq!(state.sessions[0].server, server);
         assert_eq!(state.sessions[0].windows.len(), 1);
         assert_eq!(state.sessions[0].windows[0].panes.len(), 1);
+        assert_eq!(state.sessions[0].windows[0].panes[0].command, "nvim");
+    }
+
+    #[test]
+    fn parses_list_panes_output_with_fallback_separator() {
+        let row = [
+            "$1",
+            "dev",
+            "1",
+            "1700000000",
+            "1",
+            "@2",
+            "0",
+            "editor",
+            "1",
+            "1",
+            "layout",
+            "*",
+            "%3",
+            "0",
+            "1",
+            "nvim",
+            "/tmp",
+            "title",
+            "0",
+            "0",
+            "120",
+            "40",
+            "123",
+            "0",
+            "0",
+        ]
+        .join(&FALLBACK_SEP.to_string());
+
+        let state = parse_list_panes(&row, TmuxServer::Default, FALLBACK_SEP);
+
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].name, "dev");
         assert_eq!(state.sessions[0].windows[0].panes[0].command, "nvim");
     }
 
@@ -726,6 +835,21 @@ mod tests {
         assert!(is_tmux_dir(Path::new("/run/user/1000/tmux")));
         assert!(!is_tmux_dir(Path::new("/run/user/1000/bus")));
         assert!(!is_tmux_dir(Path::new("/run/user/1000/systemd")));
+    }
+
+    #[test]
+    fn collects_non_directory_candidates_from_tmux_dirs() {
+        let root = env::temp_dir().join(format!("lazytmux-test-{}", std::process::id()));
+        let tmux_dir = root.join("tmux-9999");
+        let socket_candidate = tmux_dir.join("default");
+        fs::create_dir_all(&tmux_dir).expect("create tmux test dir");
+        fs::write(&socket_candidate, "").expect("create socket candidate");
+
+        let mut sockets = Vec::new();
+        collect_socket_paths(&tmux_dir, &mut sockets);
+
+        fs::remove_dir_all(&root).expect("remove tmux test dir");
+        assert!(sockets.contains(&socket_candidate));
     }
 
     #[test]
