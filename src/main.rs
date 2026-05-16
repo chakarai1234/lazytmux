@@ -40,7 +40,7 @@ fn main() -> Result<()> {
     run_result?;
 
     if let Some(target) = attach_target {
-        TmuxClient::default().attach_to_target(&target)?;
+        TmuxClient.attach_to_target(&target)?;
     }
 
     Ok(())

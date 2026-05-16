@@ -110,7 +110,7 @@ pub struct App {
 impl App {
     pub fn new(refresh_interval: Duration) -> Self {
         Self {
-            client: TmuxClient::default(),
+            client: TmuxClient,
             state: TmuxState::default(),
             items: Vec::new(),
             selected: 0,
