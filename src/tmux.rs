@@ -438,14 +438,18 @@ fn socket_dirs() -> Vec<PathBuf> {
         push_unique_path(&mut roots, PathBuf::from(format!("/run/user/{uid}")));
     }
 
-    let Some(uid) = uid else {
-        return roots;
-    };
-
-    roots
-        .into_iter()
-        .flat_map(|root| [root.join(format!("tmux-{uid}")), root])
-        .collect()
+    let mut dirs = Vec::new();
+    for root in roots {
+        if is_tmux_dir(&root) {
+            push_unique_path(&mut dirs, root.clone());
+        }
+        if let Some(uid) = &uid {
+            push_unique_path(&mut dirs, root.join(format!("tmux-{uid}")));
+        }
+        push_unique_path(&mut dirs, root.join("tmux"));
+        collect_tmux_dirs(&root, &mut dirs);
+    }
+    dirs
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -491,6 +495,27 @@ fn collect_socket_paths(dir: &Path, sockets: &mut Vec<PathBuf>) {
             sockets.push(entry.path());
         }
     }
+}
+
+fn collect_tmux_dirs(root: &Path, dirs: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() && is_tmux_dir(&entry.path()) {
+            push_unique_path(dirs, entry.path());
+        }
+    }
+}
+
+fn is_tmux_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("tmux"))
 }
 
 #[cfg(unix)]
@@ -682,6 +707,14 @@ mod tests {
             args,
             vec![OsString::from("list-panes"), OsString::from("-a")]
         );
+    }
+
+    #[test]
+    fn identifies_only_tmux_socket_dirs() {
+        assert!(is_tmux_dir(Path::new("/tmp/tmux-1000")));
+        assert!(is_tmux_dir(Path::new("/run/user/1000/tmux")));
+        assert!(!is_tmux_dir(Path::new("/run/user/1000/bus")));
+        assert!(!is_tmux_dir(Path::new("/run/user/1000/systemd")));
     }
 
     #[test]
