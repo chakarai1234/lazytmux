@@ -26,6 +26,33 @@ cargo run --release
 The installer builds a release binary with Cargo and installs it to
 `~/.local/bin/lazytmux`.
 
+## Install from a release
+
+Download the matching archive from the GitHub release assets:
+
+- `lazytmux-linux-x86_64.tar.gz` for Linux
+- `lazytmux-macos-universal.tar.gz` for macOS Intel and Apple Silicon
+
+```sh
+tar -xzf lazytmux-linux-x86_64.tar.gz
+install -m 755 lazytmux-linux-x86_64/lazytmux ~/.local/bin/lazytmux
+```
+
+For macOS, replace the archive and directory names with
+`lazytmux-macos-universal`.
+
+## Release
+
+Releases are created manually from the GitHub Actions `Release` workflow.
+
+1. Update `Cargo.toml` with the release version and commit the change.
+2. Push the commit to the release branch, normally `main`.
+3. Open GitHub Actions, select `Release`, then choose `Run workflow`.
+4. Enter a tag such as `v0.1.0` and choose whether it is a prerelease.
+5. Run the workflow and wait for the Linux and macOS build jobs to finish.
+6. Confirm the GitHub release contains `lazytmux-linux-x86_64.tar.gz` and
+   `lazytmux-macos-universal.tar.gz`.
+
 ## Keys
 
 - `j` / `Down`: move down
