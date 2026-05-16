@@ -167,6 +167,8 @@ pub struct TmuxClient {
 
 impl TmuxClient {
     pub fn load(&mut self) -> Result<TmuxState> {
+        let mut empty_server = None;
+
         for server in candidate_servers(&self.server) {
             let output = match tmux_output_on(&server, ["list-panes", "-a", "-F", TMUX_FORMAT]) {
                 Ok(output) => output,
@@ -177,14 +179,15 @@ impl TmuxClient {
             };
 
             if output.status.success() {
-                self.server = server.clone();
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                let mut state = parse_list_panes(&stdout, server);
-                self.capture_visible_content(&mut state);
+                let mut state = parse_list_panes(&stdout, server.clone());
                 if state.sessions.is_empty() {
-                    state.notice =
-                        Some("No tmux sessions found. Press n to create a session.".into());
+                    empty_server.get_or_insert(server);
+                    continue;
                 }
+
+                self.server = server.clone();
+                self.capture_visible_content(&mut state);
                 return Ok(state);
             }
 
@@ -193,6 +196,14 @@ impl TmuxClient {
                 continue;
             }
             return Err(anyhow!("tmux list-panes failed: {message}"));
+        }
+
+        if let Some(server) = empty_server {
+            self.server = server;
+            return Ok(TmuxState {
+                sessions: Vec::new(),
+                notice: Some("No tmux sessions found. Press n to create a session.".into()),
+            });
         }
 
         self.server = TmuxServer::Default;
