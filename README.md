@@ -17,6 +17,33 @@ built from the current tmux pane layout and captured pane screens.
 cargo run --release
 ```
 
+`lazytmux` scans the default tmux server, `$TMUX`, common Linux and macOS
+socket locations, `$TMUX_TMPDIR`, `$TMPDIR`, `$XDG_RUNTIME_DIR`, real Unix
+sockets in the current directory, and likely shared tmux sockets in temp
+roots. For custom tmux layouts, add explicit socket inputs:
+
+```sh
+lazytmux --socket /tmp/tmux-1000/default
+lazytmux --socket-name work
+lazytmux --socket-dir /run/user/1000
+```
+
+The same values may be provided with `LAZYTMUX_SOCKET`, `LAZYTMUX_SOCKETS`,
+`LAZYTMUX_SOCKET_NAME`, `LAZYTMUX_SOCKET_NAMES`, `LAZYTMUX_SOCKET_DIR`, or
+`LAZYTMUX_SOCKET_DIRS`.
+
+This covers common `tmux -S name` mistakes where the socket was created in
+the launch directory, and shared socket setups such as `/tmp/my_tmux_socket`.
+
+## Features
+
+- Multi-server Linux/macOS discovery with diagnostics (`D`)
+- Server labels in session/window/pane details
+- Persistent favorites pinned to the top (`*`)
+- Session launcher presets (`N`) with `name | start-dir | command`
+- Pane actions: send keys (`s`) and copy pane text to tmux buffer (`y`)
+- Fuzzy multi-token search across names, commands, paths, titles, IDs, and sockets
+
 ## Install
 
 ```sh
@@ -63,16 +90,21 @@ Releases are created manually from the GitHub Actions `Release` workflow.
 - `h` / `Left`: collapse selected session/window
 - `l` / `Right`: expand selected session/window
 - `Enter`: switch to the selected tmux target, or attach from outside tmux
-- `/`: filter tree
+- `/`: fuzzy multi-token filter tree
 - `f`: clear filter
 - `R`: refresh now
 - `n`: create session
+- `N`: launch session from `name | start-dir | command`
 - `w`: create window in selected session
 - `%`: split selected pane left/right
 - `"`: split selected pane top/bottom
 - `Cmd-R` or `r`: rename selected session/window or set pane title
 - `x`: kill selected session/window/pane after confirmation
 - `z`: toggle zoom on selected pane
+- `*`: toggle favorite and pin item near the top
+- `s`: send keys to selected pane, followed by Enter
+- `y`: copy selected pane text to the tmux buffer
+- `D`: show tmux diagnostics
 - `d`: detach current tmux client
 - `:`: run an arbitrary tmux command
 - `?` / `F1`: show the shortcuts page

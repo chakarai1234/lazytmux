@@ -25,6 +25,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_help(frame, area, app.help_scroll());
     }
 
+    if app.show_diagnostics() {
+        draw_diagnostics(frame, area, app);
+    }
+
     if let Some(confirm) = app.confirm() {
         draw_confirm(frame, area, &confirm.message);
     }
@@ -53,7 +57,8 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("tmux visualizer", Style::default().fg(Color::DarkGray)),
     ]);
     let stats = Line::from(format!(
-        "sessions: {sessions}  windows: {windows}  panes: {panes}  filter: {filter}  ?/F1 shortcuts"
+        "sessions: {sessions}  windows: {windows}  panes: {panes}  favorites: {}  filter: {filter}  ?/F1 shortcuts",
+        app.favorites_count()
     ));
 
     let header = Paragraph::new(vec![title, stats])
@@ -111,6 +116,9 @@ fn render_tree_item(item: &TreeItem) -> ListItem<'_> {
     }
     if item.dead {
         style = style.fg(Color::Red);
+    }
+    if item.favorite {
+        style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
     }
 
     let kind = match item.kind {
@@ -308,7 +316,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let status = Paragraph::new(vec![
         Line::from(app.status().to_string()),
         Line::from(Span::styled(
-            "?/F1 shortcuts  |  q/Esc quit  |  Enter switch/attach  |  r or Cmd-R rename",
+            "?/F1 shortcuts  |  D diagnostics  |  * favorite  |  s send keys  |  y copy pane",
             Style::default().fg(Color::DarkGray),
         )),
     ])
@@ -354,6 +362,53 @@ fn draw_confirm(frame: &mut Frame, area: Rect, message: &str) {
     frame.render_widget(confirm, popup);
 }
 
+fn draw_diagnostics(frame: &mut Frame, area: Rect, app: &App) {
+    frame.render_widget(Clear, area);
+    let mut lines = vec![
+        Line::from(vec![Span::styled(
+            "tmux diagnostics",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(
+            "Close with D/q/Esc. Scroll with j/k, arrows, PageUp/PageDown, or Ctrl-U/Ctrl-D.",
+        ),
+        Line::from(""),
+    ];
+
+    if let Some(item) = app.selected_item() {
+        lines.push(Line::from(format!(
+            "Selected target: {}",
+            item.target.display()
+        )));
+        lines.push(Line::from(format!(
+            "Selected server: {}",
+            item.target.server_label()
+        )));
+        lines.push(Line::from(""));
+    }
+
+    if app.diagnostics().is_empty() {
+        lines.push(Line::from("No diagnostics collected yet."));
+    } else {
+        for diagnostic in app.diagnostics() {
+            lines.push(Line::from(diagnostic.clone()));
+        }
+    }
+
+    let diagnostics = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title("Diagnostics")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .scroll((app.diagnostics_scroll(), 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(diagnostics, area);
+}
+
 fn draw_help(frame: &mut Frame, area: Rect, scroll: u16) {
     frame.render_widget(Clear, area);
     let help = Paragraph::new(vec![
@@ -376,12 +431,16 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: u16) {
         Line::from("App tmux actions"),
         Line::from("  Enter: switch to target inside tmux, attach outside tmux"),
         Line::from("  n: new session"),
+        Line::from("  N: launch session preset (name | start-dir | command)"),
         Line::from("  w: new window in selected session"),
         Line::from("  %: split selected pane left/right"),
         Line::from("  \": split selected pane top/bottom"),
         Line::from("  Cmd-R or r: rename session/window or set pane title"),
         Line::from("  x: kill selected item after confirmation"),
         Line::from("  z: toggle pane zoom"),
+        Line::from("  *: toggle favorite/pin"),
+        Line::from("  s: send keys to selected pane"),
+        Line::from("  y: copy selected pane text to tmux buffer"),
         Line::from("  d: detach current client"),
         Line::from("  :: run arbitrary tmux command without the leading tmux word"),
         Line::from(""),
@@ -398,9 +457,10 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: u16) {
         Line::from("  Prefix [: copy mode"),
         Line::from(""),
         Line::from("View"),
-        Line::from("  /: filter"),
+        Line::from("  /: fuzzy multi-token filter"),
         Line::from("  f: clear filter"),
         Line::from("  R: refresh now"),
+        Line::from("  D: diagnostics"),
         Line::from("  ?/q/Esc: close this shortcuts page"),
         Line::from("  q/Esc/Ctrl-C: quit when the shortcuts page is closed"),
     ])

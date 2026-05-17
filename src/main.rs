@@ -3,6 +3,7 @@ mod tmux;
 mod ui;
 
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -15,7 +16,7 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use tmux::TmuxClient;
+use tmux::{TmuxClient, TmuxClientOptions};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -25,12 +26,51 @@ struct Cli {
 
     #[arg(long, help = "Disable mouse capture")]
     no_mouse: bool,
+
+    #[arg(
+        short = 'S',
+        long = "socket",
+        value_name = "PATH",
+        help = "Add an explicit tmux socket path to scan"
+    )]
+    sockets: Vec<PathBuf>,
+
+    #[arg(
+        short = 'L',
+        long = "socket-name",
+        value_name = "NAME",
+        help = "Add a tmux -L socket name to scan"
+    )]
+    socket_names: Vec<String>,
+
+    #[arg(
+        long = "socket-dir",
+        value_name = "DIR",
+        help = "Add a directory or tmux socket root to scan"
+    )]
+    socket_dirs: Vec<PathBuf>,
+}
+
+impl Cli {
+    fn tmux_options(&self) -> TmuxClientOptions {
+        let mut options = TmuxClientOptions::from_env();
+        options.socket_paths.extend(self.sockets.iter().cloned());
+        options
+            .socket_names
+            .extend(self.socket_names.iter().cloned());
+        options.socket_dirs.extend(self.socket_dirs.iter().cloned());
+        options
+    }
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let tmux_options = cli.tmux_options();
     let mut terminal = setup_terminal(cli.no_mouse)?;
-    let mut app = App::new(Duration::from_secs(cli.refresh_seconds.max(1)));
+    let mut app = App::with_client(
+        Duration::from_secs(cli.refresh_seconds.max(1)),
+        TmuxClient::with_options(tmux_options),
+    );
 
     let run_result = app.run(&mut terminal);
     let attach_target = app.take_attach_target();

@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::fs;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
@@ -24,6 +26,8 @@ pub struct TreeItem {
     pub label: String,
     pub subtitle: String,
     pub target: TmuxTarget,
+    pub favorite_key: String,
+    pub favorite: bool,
     pub rename_value: String,
     pub details: Vec<(String, String)>,
     pub preview: Option<TerminalPreview>,
@@ -68,22 +72,24 @@ enum PromptKind {
     Filter,
     Rename(RenameTarget),
     NewSession,
-    NewWindow { session_id: String },
+    LaunchSession,
+    NewWindow { target: TmuxTarget },
+    SendKeys { target: TmuxTarget },
     Command,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RenameTarget {
-    Session { id: String },
-    Window { id: String },
-    Pane { id: String },
+    Session { target: TmuxTarget },
+    Window { target: TmuxTarget },
+    Pane { target: TmuxTarget },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum KillTarget {
-    Session { id: String },
-    Window { id: String },
-    Pane { id: String },
+    Session { target: TmuxTarget },
+    Window { target: TmuxTarget },
+    Pane { target: TmuxTarget },
 }
 
 #[derive(Debug)]
@@ -96,11 +102,14 @@ pub struct App {
     help_scroll: u16,
     collapsed_sessions: HashSet<String>,
     collapsed_windows: HashSet<String>,
+    favorites: HashSet<String>,
     filter: String,
     prompt: Option<Prompt>,
     confirm: Option<Confirm>,
     status: String,
     show_help: bool,
+    show_diagnostics: bool,
+    diagnostics_scroll: u16,
     should_quit: bool,
     attach_target: Option<TmuxTarget>,
     last_refresh: Instant,
@@ -108,9 +117,9 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(refresh_interval: Duration) -> Self {
+    pub fn with_client(refresh_interval: Duration, client: TmuxClient) -> Self {
         Self {
-            client: TmuxClient::default(),
+            client,
             state: TmuxState::default(),
             items: Vec::new(),
             selected: 0,
@@ -118,11 +127,14 @@ impl App {
             help_scroll: 0,
             collapsed_sessions: HashSet::new(),
             collapsed_windows: HashSet::new(),
+            favorites: load_favorites(),
             filter: String::new(),
             prompt: None,
             confirm: None,
             status: "Starting lazytmux".into(),
             show_help: false,
+            show_diagnostics: false,
+            diagnostics_scroll: 0,
             should_quit: false,
             attach_target: None,
             last_refresh: Instant::now(),
@@ -173,6 +185,10 @@ impl App {
         self.help_scroll
     }
 
+    pub fn diagnostics_scroll(&self) -> u16 {
+        self.diagnostics_scroll
+    }
+
     pub fn selected_item(&self) -> Option<&TreeItem> {
         self.items.get(self.selected)
     }
@@ -195,6 +211,18 @@ impl App {
 
     pub fn show_help(&self) -> bool {
         self.show_help
+    }
+
+    pub fn show_diagnostics(&self) -> bool {
+        self.show_diagnostics
+    }
+
+    pub fn diagnostics(&self) -> &[String] {
+        &self.state.diagnostics
+    }
+
+    pub fn favorites_count(&self) -> usize {
+        self.favorites.len()
     }
 
     pub fn counts(&self) -> (usize, usize, usize) {
@@ -222,6 +250,11 @@ impl App {
 
         if self.show_help {
             self.handle_help_key(key);
+            return Ok(());
+        }
+
+        if self.show_diagnostics {
+            self.handle_diagnostics_key(key);
             return Ok(());
         }
 
@@ -253,6 +286,7 @@ impl App {
             }
             KeyCode::Char('R') => self.refresh(),
             KeyCode::Char('n') => self.open_new_session_prompt(),
+            KeyCode::Char('N') => self.open_launch_session_prompt(),
             KeyCode::Char('w') => self.open_new_window_prompt(),
             KeyCode::Char('%') => self.split_selected(SplitDirection::Horizontal),
             KeyCode::Char('"') => self.split_selected(SplitDirection::Vertical),
@@ -262,6 +296,10 @@ impl App {
             KeyCode::Char('r') => self.open_rename_prompt(),
             KeyCode::Char('x') => self.open_kill_confirm(),
             KeyCode::Char('z') => self.zoom_selected(),
+            KeyCode::Char('*') => self.toggle_favorite(),
+            KeyCode::Char('s') => self.open_send_keys_prompt(),
+            KeyCode::Char('y') => self.copy_selected_pane(),
+            KeyCode::Char('D') => self.open_diagnostics(),
             KeyCode::Char('d') => self.detach_client(),
             KeyCode::Char(':') => self.open_command_prompt(),
             KeyCode::F(1) | KeyCode::Char('?') => self.open_help(),
@@ -292,6 +330,32 @@ impl App {
             KeyCode::Char(']') => self.scroll_help(4),
             KeyCode::Char('[') => self.scroll_help(-4),
             KeyCode::Home | KeyCode::Char('g') => self.help_scroll = 0,
+            _ => {}
+        }
+    }
+
+    fn handle_diagnostics_key(&mut self, key: KeyEvent) {
+        if matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('D')
+        ) {
+            self.show_diagnostics = false;
+            self.diagnostics_scroll = 0;
+            return;
+        }
+
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_diagnostics(1),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_diagnostics(-1),
+            KeyCode::PageDown => self.scroll_diagnostics(8),
+            KeyCode::PageUp => self.scroll_diagnostics(-8),
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_diagnostics(8)
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_diagnostics(-8)
+            }
+            KeyCode::Home | KeyCode::Char('g') => self.diagnostics_scroll = 0,
             _ => {}
         }
     }
@@ -357,8 +421,14 @@ impl App {
     fn rebuild_items(&mut self) {
         let mut items = Vec::new();
         let filter = self.filter.trim().to_lowercase();
+        let mut sessions: Vec<&Session> = self.state.sessions.iter().collect();
+        sessions.sort_by(|left, right| {
+            self.is_session_favorite(right)
+                .cmp(&self.is_session_favorite(left))
+                .then_with(|| left.name.cmp(&right.name))
+        });
 
-        for session in &self.state.sessions {
+        for session in sessions {
             if filter.is_empty() {
                 self.push_unfiltered_session(&mut items, session);
             } else {
@@ -379,35 +449,63 @@ impl App {
     }
 
     fn push_unfiltered_session(&self, items: &mut Vec<TreeItem>, session: &Session) {
-        items.push(session_item(session));
+        items.push(self.decorate_item(session_item(session)));
         if self.collapsed_sessions.contains(&session.id) {
             return;
         }
 
-        for window in &session.windows {
-            items.push(window_item(session, window));
+        let mut windows: Vec<&Window> = session.windows.iter().collect();
+        windows.sort_by(|left, right| {
+            self.is_window_favorite(session, right)
+                .cmp(&self.is_window_favorite(session, left))
+                .then_with(|| left.index.cmp(&right.index))
+        });
+
+        for window in windows {
+            items.push(self.decorate_item(window_item(session, window)));
             if self.collapsed_windows.contains(&window.id) {
                 continue;
             }
 
-            for pane in &window.panes {
-                items.push(pane_item(session, window, pane));
+            let mut panes: Vec<&Pane> = window.panes.iter().collect();
+            panes.sort_by(|left, right| {
+                self.is_pane_favorite(session, window, right)
+                    .cmp(&self.is_pane_favorite(session, window, left))
+                    .then_with(|| left.index.cmp(&right.index))
+            });
+
+            for pane in panes {
+                items.push(self.decorate_item(pane_item(session, window, pane)));
             }
         }
     }
 
     fn push_filtered_session(&self, items: &mut Vec<TreeItem>, session: &Session, filter: &str) {
-        let session_item = session_item(session);
+        let session_item = self.decorate_item(session_item(session));
         let session_match = matches_filter(&session_item, filter);
         let mut block = Vec::new();
 
-        for window in &session.windows {
-            let window_item = window_item(session, window);
+        let mut windows: Vec<&Window> = session.windows.iter().collect();
+        windows.sort_by(|left, right| {
+            self.is_window_favorite(session, right)
+                .cmp(&self.is_window_favorite(session, left))
+                .then_with(|| left.index.cmp(&right.index))
+        });
+
+        for window in windows {
+            let window_item = self.decorate_item(window_item(session, window));
             let window_match = matches_filter(&window_item, filter);
             let mut pane_block = Vec::new();
 
-            for pane in &window.panes {
-                let pane_item = pane_item(session, window, pane);
+            let mut panes: Vec<&Pane> = window.panes.iter().collect();
+            panes.sort_by(|left, right| {
+                self.is_pane_favorite(session, window, right)
+                    .cmp(&self.is_pane_favorite(session, window, left))
+                    .then_with(|| left.index.cmp(&right.index))
+            });
+
+            for pane in panes {
+                let pane_item = self.decorate_item(pane_item(session, window, pane));
                 if session_match || window_match || matches_filter(&pane_item, filter) {
                     pane_block.push(pane_item);
                 }
@@ -423,6 +521,40 @@ impl App {
             items.push(session_item);
             items.extend(block);
         }
+    }
+
+    fn decorate_item(&self, mut item: TreeItem) -> TreeItem {
+        item.favorite = self.favorites.contains(&item.favorite_key);
+        if item.favorite {
+            item.label = format!("* {}", item.label);
+        }
+        item.details
+            .push(("Favorite".into(), item.favorite.to_string()));
+        item
+    }
+
+    fn is_session_favorite(&self, session: &Session) -> bool {
+        let target = TmuxTarget::session_on(session.id.clone(), session.server.clone());
+        self.favorites.contains(&target.favorite_key())
+    }
+
+    fn is_window_favorite(&self, session: &Session, window: &Window) -> bool {
+        let target = TmuxTarget::window_on(
+            session.id.clone(),
+            window.id.clone(),
+            session.server.clone(),
+        );
+        self.favorites.contains(&target.favorite_key())
+    }
+
+    fn is_pane_favorite(&self, session: &Session, window: &Window, pane: &Pane) -> bool {
+        let target = TmuxTarget::pane_on(
+            session.id.clone(),
+            window.id.clone(),
+            pane.id.clone(),
+            session.server.clone(),
+        );
+        self.favorites.contains(&target.favorite_key())
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -458,11 +590,22 @@ impl App {
         self.help_scroll = next.clamp(0, u16::MAX as i32) as u16;
     }
 
+    fn scroll_diagnostics(&mut self, delta: i16) {
+        let next = self.diagnostics_scroll as i32 + delta as i32;
+        self.diagnostics_scroll = next.clamp(0, u16::MAX as i32) as u16;
+    }
+
     fn open_help(&mut self) {
         self.show_help = true;
         self.help_scroll = 0;
         self.status =
             "Shortcuts page open. Scroll with j/k or arrows; close with ?/F1/q/Esc.".into();
+    }
+
+    fn open_diagnostics(&mut self) {
+        self.show_diagnostics = true;
+        self.diagnostics_scroll = 0;
+        self.status = "Diagnostics open. Scroll with j/k; close with D/q/Esc.".into();
     }
 
     fn toggle_selected(&mut self) {
@@ -563,6 +706,15 @@ impl App {
         });
     }
 
+    fn open_launch_session_prompt(&mut self) {
+        self.prompt = Some(Prompt {
+            title: "Launch session".into(),
+            value: "".into(),
+            hint: "Format: name | start-dir | command. Only name is required.".into(),
+            kind: PromptKind::LaunchSession,
+        });
+    }
+
     fn open_new_window_prompt(&mut self) {
         let Some(item) = self.selected_item() else {
             self.status = "Select a session/window/pane before creating a window".into();
@@ -574,13 +726,13 @@ impl App {
             value: "".into(),
             hint: "Enter a window name".into(),
             kind: PromptKind::NewWindow {
-                session_id: item.target.session_id.clone(),
+                target: item.target.clone(),
             },
         });
     }
 
     fn split_selected(&mut self, direction: SplitDirection) {
-        let Some(pane_id) = self.selected_pane_id() else {
+        let Some(target) = self.selected_pane_target() else {
             self.status = "Select a pane before splitting".into();
             return;
         };
@@ -589,7 +741,7 @@ impl App {
             SplitDirection::Horizontal => "Split pane horizontally",
             SplitDirection::Vertical => "Split pane vertically",
         };
-        self.apply_tmux_result(label, self.client.split_pane(&pane_id, direction));
+        self.apply_tmux_result(label, self.client.split_pane(&target, direction));
         self.refresh();
     }
 
@@ -604,21 +756,21 @@ impl App {
                 "Rename session",
                 item.rename_value.clone(),
                 PromptKind::Rename(RenameTarget::Session {
-                    id: item.target.session_id.clone(),
+                    target: item.target.clone(),
                 }),
             ),
             TreeItemKind::Window => (
                 "Rename window",
                 item.rename_value.clone(),
                 PromptKind::Rename(RenameTarget::Window {
-                    id: item.target.window_id.clone().unwrap_or_default(),
+                    target: item.target.clone(),
                 }),
             ),
             TreeItemKind::Pane => (
                 "Set pane title",
                 item.rename_value.clone(),
                 PromptKind::Rename(RenameTarget::Pane {
-                    id: item.target.pane_id.clone().unwrap_or_default(),
+                    target: item.target.clone(),
                 }),
             ),
         };
@@ -641,19 +793,19 @@ impl App {
             TreeItemKind::Session => (
                 format!("Kill session {}?", item.label),
                 KillTarget::Session {
-                    id: item.target.session_id.clone(),
+                    target: item.target.clone(),
                 },
             ),
             TreeItemKind::Window => (
                 format!("Kill window {}?", item.label),
                 KillTarget::Window {
-                    id: item.target.window_id.clone().unwrap_or_default(),
+                    target: item.target.clone(),
                 },
             ),
             TreeItemKind::Pane => (
                 format!("Kill pane {}?", item.label),
                 KillTarget::Pane {
-                    id: item.target.pane_id.clone().unwrap_or_default(),
+                    target: item.target.clone(),
                 },
             ),
         };
@@ -665,12 +817,57 @@ impl App {
     }
 
     fn zoom_selected(&mut self) {
-        let Some(pane_id) = self.selected_pane_id() else {
+        let Some(target) = self.selected_pane_target() else {
             self.status = "Select a pane before toggling zoom".into();
             return;
         };
-        self.apply_tmux_result("Toggled pane zoom", self.client.toggle_zoom(&pane_id));
+        self.apply_tmux_result("Toggled pane zoom", self.client.toggle_zoom(&target));
         self.refresh();
+    }
+
+    fn open_send_keys_prompt(&mut self) {
+        let Some(target) = self.selected_pane_target() else {
+            self.status = "Select a pane before sending keys".into();
+            return;
+        };
+
+        self.prompt = Some(Prompt {
+            title: "Send keys".into(),
+            value: "".into(),
+            hint: "Text is sent to the pane followed by Enter".into(),
+            kind: PromptKind::SendKeys { target },
+        });
+    }
+
+    fn copy_selected_pane(&mut self) {
+        let Some(target) = self.selected_pane_target() else {
+            self.status = "Select a pane before copying pane text".into();
+            return;
+        };
+
+        self.apply_tmux_result(
+            "Copied pane text to tmux buffer",
+            self.client.copy_pane_to_buffer(&target),
+        );
+    }
+
+    fn toggle_favorite(&mut self) {
+        let Some(item) = self.selected_item().cloned() else {
+            self.status = "No item selected to favorite".into();
+            return;
+        };
+
+        if !self.favorites.remove(&item.favorite_key) {
+            self.favorites.insert(item.favorite_key.clone());
+            self.status = format!("Favorited {}", item.label);
+        } else {
+            self.status = format!("Removed favorite {}", item.label);
+        }
+
+        if let Err(error) = save_favorites(&self.favorites) {
+            self.status = format!("Favorite updated, but save failed: {error}");
+        }
+        self.rebuild_items();
     }
 
     fn detach_client(&mut self) {
@@ -700,22 +897,22 @@ impl App {
                     return Ok(());
                 }
                 match target {
-                    RenameTarget::Session { id } => {
+                    RenameTarget::Session { target } => {
                         self.apply_tmux_result(
                             "Renamed session",
-                            self.client.rename_session(&id, value),
+                            self.client.rename_session(&target, value),
                         );
                     }
-                    RenameTarget::Window { id } => {
+                    RenameTarget::Window { target } => {
                         self.apply_tmux_result(
                             "Renamed window",
-                            self.client.rename_window(&id, value),
+                            self.client.rename_window(&target, value),
                         );
                     }
-                    RenameTarget::Pane { id } => {
+                    RenameTarget::Pane { target } => {
                         self.apply_tmux_result(
                             "Set pane title",
-                            self.client.rename_pane(&id, value),
+                            self.client.rename_pane(&target, value),
                         );
                     }
                 }
@@ -729,15 +926,24 @@ impl App {
                 self.apply_tmux_result("Created session", self.client.create_session(value));
                 self.refresh();
             }
-            PromptKind::NewWindow { session_id } => {
+            PromptKind::LaunchSession => {
+                let (name, start_dir, command) = parse_session_launcher(value)?;
+                self.apply_tmux_result(
+                    "Launched session",
+                    self.client.create_session_with(
+                        &name,
+                        start_dir.as_deref(),
+                        command.as_deref(),
+                    ),
+                );
+                self.refresh();
+            }
+            PromptKind::NewWindow { target } => {
                 if value.is_empty() {
                     self.status = "Window name cannot be empty".into();
                     return Ok(());
                 }
-                self.apply_tmux_result(
-                    "Created window",
-                    self.client.create_window(&session_id, value),
-                );
+                self.apply_tmux_result("Created window", self.client.create_window(&target, value));
                 self.refresh();
             }
             PromptKind::Command => {
@@ -749,6 +955,14 @@ impl App {
                 self.apply_tmux_result("Ran tmux command", self.client.run_args(&args));
                 self.refresh();
             }
+            PromptKind::SendKeys { target } => {
+                if value.is_empty() {
+                    self.status = "No keys entered".into();
+                    return Ok(());
+                }
+                self.apply_tmux_result("Sent keys", self.client.send_keys(&target, value));
+                self.refresh();
+            }
         }
 
         Ok(())
@@ -756,22 +970,23 @@ impl App {
 
     fn apply_kill(&mut self, target: KillTarget) {
         match target {
-            KillTarget::Session { id } => {
-                self.apply_tmux_result("Killed session", self.client.kill_session(&id));
+            KillTarget::Session { target } => {
+                self.apply_tmux_result("Killed session", self.client.kill_session(&target));
             }
-            KillTarget::Window { id } => {
-                self.apply_tmux_result("Killed window", self.client.kill_window(&id));
+            KillTarget::Window { target } => {
+                self.apply_tmux_result("Killed window", self.client.kill_window(&target));
             }
-            KillTarget::Pane { id } => {
-                self.apply_tmux_result("Killed pane", self.client.kill_pane(&id));
+            KillTarget::Pane { target } => {
+                self.apply_tmux_result("Killed pane", self.client.kill_pane(&target));
             }
         }
         self.refresh();
     }
 
-    fn selected_pane_id(&self) -> Option<String> {
+    fn selected_pane_target(&self) -> Option<TmuxTarget> {
         self.selected_item()
-            .and_then(|item| item.target.pane_id.clone())
+            .filter(|item| item.target.pane_id.is_some())
+            .map(|item| item.target.clone())
     }
 
     fn apply_tmux_result(&mut self, success: &str, result: Result<()>) {
@@ -794,21 +1009,27 @@ fn session_item(session: &Session) -> TreeItem {
         .find(|window| window.active)
         .or_else(|| session.windows.first());
 
+    let target = TmuxTarget::session_on(session.id.clone(), session.server.clone());
+
     TreeItem {
         kind: TreeItemKind::Session,
         depth: 0,
         name: session.name.clone(),
         label: format!("[S] {}", session.name),
         subtitle: format!(
-            "{} windows{}",
+            "{} windows{}  {}",
             session.window_count.unwrap_or(session.windows.len()),
-            if session.attached { ", attached" } else { "" }
+            if session.attached { ", attached" } else { "" },
+            session.server.label()
         ),
-        target: TmuxTarget::session_on(session.id.clone(), session.server.clone()),
+        favorite_key: target.favorite_key(),
+        target,
+        favorite: false,
         rename_value: session.name.clone(),
         details: vec![
             ("Type".into(), "Session".into()),
             ("ID".into(), session.id.clone()),
+            ("Server".into(), session.server.label()),
             ("Name".into(), session.name.clone()),
             ("Attached".into(), session.attached.to_string()),
             (
@@ -855,6 +1076,12 @@ fn window_item(session: &Session, window: &Window) -> TreeItem {
         .collect::<Vec<_>>()
         .join(", ");
 
+    let target = TmuxTarget::window_on(
+        session.id.clone(),
+        window.id.clone(),
+        session.server.clone(),
+    );
+
     TreeItem {
         kind: TreeItemKind::Window,
         depth: 1,
@@ -865,15 +1092,14 @@ fn window_item(session: &Session, window: &Window) -> TreeItem {
             window.pane_count.unwrap_or(window.panes.len()),
             window.flags
         ),
-        target: TmuxTarget::window_on(
-            session.id.clone(),
-            window.id.clone(),
-            session.server.clone(),
-        ),
+        favorite_key: target.favorite_key(),
+        target,
+        favorite: false,
         rename_value: window.name.clone(),
         details: vec![
             ("Type".into(), "Window".into()),
             ("ID".into(), window.id.clone()),
+            ("Server".into(), session.server.label()),
             ("Session".into(), session.name.clone()),
             ("Index".into(), window.index.clone()),
             ("Name".into(), window.name.clone()),
@@ -909,6 +1135,12 @@ fn pane_item(session: &Session, window: &Window, pane: &Pane) -> TreeItem {
         _ => "unknown".into(),
     };
     let name = pane_name(pane);
+    let target = TmuxTarget::pane_on(
+        session.id.clone(),
+        window.id.clone(),
+        pane.id.clone(),
+        session.server.clone(),
+    );
 
     TreeItem {
         kind: TreeItemKind::Pane,
@@ -920,12 +1152,9 @@ fn pane_item(session: &Session, window: &Window, pane: &Pane) -> TreeItem {
         } else {
             format!("{} - {}", pane.command, pane.path)
         },
-        target: TmuxTarget::pane_on(
-            session.id.clone(),
-            window.id.clone(),
-            pane.id.clone(),
-            session.server.clone(),
-        ),
+        favorite_key: target.favorite_key(),
+        target,
+        favorite: false,
         rename_value: if pane.title.is_empty() {
             name.clone()
         } else {
@@ -934,6 +1163,7 @@ fn pane_item(session: &Session, window: &Window, pane: &Pane) -> TreeItem {
         details: vec![
             ("Type".into(), "Pane".into()),
             ("ID".into(), pane.id.clone()),
+            ("Server".into(), session.server.label()),
             ("Session".into(), session.name.clone()),
             ("Window".into(), format!("{}:{}", window.index, window.name)),
             ("Name".into(), name.clone()),
@@ -969,13 +1199,46 @@ fn pane_item(session: &Session, window: &Window, pane: &Pane) -> TreeItem {
 }
 
 fn matches_filter(item: &TreeItem, filter: &str) -> bool {
-    item.label.to_lowercase().contains(filter)
-        || item.name.to_lowercase().contains(filter)
-        || item.subtitle.to_lowercase().contains(filter)
-        || item
-            .details
+    let searchable = std::iter::once(item.label.as_str())
+        .chain(std::iter::once(item.name.as_str()))
+        .chain(std::iter::once(item.subtitle.as_str()))
+        .chain(std::iter::once(item.favorite_key.as_str()))
+        .chain(
+            item.details
+                .iter()
+                .flat_map(|(label, value)| [label.as_str(), value.as_str()]),
+        )
+        .collect::<Vec<_>>();
+
+    filter.split_whitespace().all(|token| {
+        searchable
             .iter()
-            .any(|(_, value)| value.to_lowercase().contains(filter))
+            .any(|value| matches_search_token(value, token))
+    })
+}
+
+fn matches_search_token(value: &str, token: &str) -> bool {
+    let value = value.to_lowercase();
+    let token = token.to_lowercase();
+    value.contains(&token) || fuzzy_match(&value, &token)
+}
+
+fn fuzzy_match(value: &str, token: &str) -> bool {
+    if token.is_empty() {
+        return true;
+    }
+
+    let mut token_chars = token.chars();
+    let mut current = token_chars.next();
+    for character in value.chars() {
+        if Some(character) == current {
+            current = token_chars.next();
+            if current.is_none() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn pane_name(pane: &Pane) -> String {
@@ -1088,6 +1351,64 @@ fn split_tmux_args(input: &str) -> Result<Vec<String>> {
     Ok(args)
 }
 
+fn parse_session_launcher(input: &str) -> Result<(String, Option<String>, Option<String>)> {
+    let parts = input.splitn(3, '|').map(str::trim).collect::<Vec<_>>();
+    let name = parts.first().copied().unwrap_or_default();
+    if name.is_empty() {
+        bail!("session name cannot be empty");
+    }
+
+    let start_dir = parts
+        .get(1)
+        .copied()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let command = parts
+        .get(2)
+        .copied()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    Ok((name.to_string(), start_dir, command))
+}
+
+fn load_favorites() -> HashSet<String> {
+    let Some(path) = favorites_path() else {
+        return HashSet::new();
+    };
+    let Ok(content) = fs::read_to_string(path) else {
+        return HashSet::new();
+    };
+
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn save_favorites(favorites: &HashSet<String>) -> Result<()> {
+    let Some(path) = favorites_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut values = favorites.iter().cloned().collect::<Vec<_>>();
+    values.sort();
+    fs::write(path, values.join("\n"))?;
+    Ok(())
+}
+
+fn favorites_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
+        return Some(PathBuf::from(path).join("lazytmux/favorites"));
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state/lazytmux/favorites"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,5 +1423,21 @@ mod tests {
     fn rejects_leading_tmux_word() {
         let error = split_tmux_args("tmux list-sessions").unwrap_err();
         assert!(error.to_string().contains("omit"));
+    }
+
+    #[test]
+    fn parses_session_launcher_input() {
+        let (name, start_dir, command) =
+            parse_session_launcher("work | /tmp | nvim README.md").unwrap();
+
+        assert_eq!(name, "work");
+        assert_eq!(start_dir.as_deref(), Some("/tmp"));
+        assert_eq!(command.as_deref(), Some("nvim README.md"));
+    }
+
+    #[test]
+    fn fuzzy_matches_ordered_characters() {
+        assert!(fuzzy_match("openai_dashboard", "oad"));
+        assert!(!fuzzy_match("logging", "zg"));
     }
 }
