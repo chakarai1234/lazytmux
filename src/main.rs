@@ -1,4 +1,5 @@
 mod app;
+mod metrics;
 mod tmux;
 mod ui;
 

@@ -5,6 +5,9 @@ panes in a lazygit/lazydocker-style interface.
 Selecting a session, window, or pane shows a terminal-style actual view
 built from the current tmux pane layout and captured pane screens.
 
+Thanks to `lazygit` and `lazydocker` for the inspiration: `lazytmux`
+follows their fast, focused terminal UI style for tmux workflows.
+
 ## Requirements
 
 - Rust toolchain with `cargo`
@@ -37,6 +40,9 @@ the launch directory, and shared socket setups such as `/tmp/my_tmux_socket`.
 
 ## Features
 
+- Collapsed-by-default session tree with Right/Left expansion controls
+- Global CPU, memory, and load metrics in the header
+- Deep per-pane process-tree CPU and memory metrics in details
 - Multi-server Linux/macOS discovery with diagnostics (`D`)
 - Server labels in session/window/pane details
 - Persistent favorites pinned to the top (`*`)
@@ -87,8 +93,8 @@ Releases are created manually from the GitHub Actions `Release` workflow.
 - `g` / `G`: jump to top or bottom
 - `[` / `]` or `Ctrl-U` / `Ctrl-D`: scroll details
 - `Space`: expand or collapse selected session/window
-- `h` / `Left`: collapse selected session/window
-- `l` / `Right`: expand selected session/window
+- `Left` / `h`: collapse selected session/window
+- `Right` / `l`: expand selected session/window
 - `Enter`: switch to the selected tmux target, or attach from outside tmux
 - `/`: fuzzy multi-token filter tree
 - `f`: clear filter

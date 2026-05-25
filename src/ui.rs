@@ -5,13 +5,14 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{App, TerminalPanePreview, TerminalPreview, TreeItem, TreeItemKind};
+use crate::metrics::{format_cpu_usage, format_memory_usage, SystemMetrics};
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(5),
             Constraint::Min(8),
             Constraint::Length(4),
         ])
@@ -60,8 +61,9 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         "sessions: {sessions}  windows: {windows}  panes: {panes}  favorites: {}  filter: {filter}  ?/F1 shortcuts",
         app.favorites_count()
     ));
+    let metrics = render_system_metrics(app.system_metrics(), app.cpu_metrics_ready());
 
-    let header = Paragraph::new(vec![title, stats])
+    let header = Paragraph::new(vec![title, stats, metrics])
         .block(Block::default().borders(Borders::ALL))
         .alignment(Alignment::Left);
     frame.render_widget(header, area);
@@ -126,9 +128,15 @@ fn render_tree_item(item: &TreeItem) -> ListItem<'_> {
         TreeItemKind::Window => "window",
         TreeItemKind::Pane => "pane",
     };
+    let expansion = match item.expanded {
+        Some(true) => "- ",
+        Some(false) => "+ ",
+        None => "  ",
+    };
 
     let line = Line::from(vec![
         Span::raw(indent),
+        Span::styled(expansion, Style::default().fg(Color::DarkGray)),
         Span::styled(item.label.clone(), style),
         Span::raw("  "),
         Span::styled(kind, Style::default().fg(Color::DarkGray)),
@@ -312,11 +320,26 @@ fn scale_coordinate(value: u16, source: u16, target: u16) -> u16 {
     }
 }
 
+fn render_system_metrics(metrics: &SystemMetrics, cpu_ready: bool) -> Line<'static> {
+    let cpu = metrics
+        .cpu_usage
+        .map(|usage| format_cpu_usage(usage, cpu_ready))
+        .unwrap_or_else(|| "unavailable".into());
+    let memory = format_memory_usage(metrics.memory_used, metrics.memory_total);
+    let load = metrics
+        .load_average
+        .as_ref()
+        .map(|load| format!("{:.2}/{:.2}/{:.2}", load.one, load.five, load.fifteen))
+        .unwrap_or_else(|| "unavailable".into());
+
+    Line::from(format!("cpu: {cpu}  mem: {memory}  load: {load}"))
+}
+
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let status = Paragraph::new(vec![
         Line::from(app.status().to_string()),
         Line::from(Span::styled(
-            "?/F1 shortcuts  |  D diagnostics  |  * favorite  |  s send keys  |  y copy pane",
+            "Left/Right collapse/expand  |  D diagnostics  |  * favorite  |  s send keys  |  y copy pane",
             Style::default().fg(Color::DarkGray),
         )),
     ])
@@ -425,7 +448,7 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: u16) {
         Line::from("  j/k or Up/Down: move selection"),
         Line::from("  g/G: top/bottom"),
         Line::from("  Space: expand/collapse selected session or window"),
-        Line::from("  h/l or Left/Right: collapse/expand"),
+        Line::from("  Left/Right or h/l: collapse/expand"),
         Line::from("  [ and ] or Ctrl-U/Ctrl-D: scroll details and pane content"),
         Line::from(""),
         Line::from("App tmux actions"),

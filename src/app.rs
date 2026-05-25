@@ -8,6 +8,9 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use ratatui::backend::Backend;
 use ratatui::Terminal;
 
+use crate::metrics::{
+    format_bytes, format_cpu_usage, MetricsSampler, MetricsSnapshot, ProcessMetrics, SystemMetrics,
+};
 use crate::tmux::{Pane, Session, SplitDirection, TmuxClient, TmuxState, TmuxTarget, Window};
 use crate::ui;
 
@@ -31,6 +34,7 @@ pub struct TreeItem {
     pub rename_value: String,
     pub details: Vec<(String, String)>,
     pub preview: Option<TerminalPreview>,
+    pub expanded: Option<bool>,
     pub active: bool,
     pub dead: bool,
 }
@@ -100,9 +104,11 @@ pub struct App {
     selected: usize,
     detail_scroll: u16,
     help_scroll: u16,
-    collapsed_sessions: HashSet<String>,
-    collapsed_windows: HashSet<String>,
+    expanded_sessions: HashSet<String>,
+    expanded_windows: HashSet<String>,
     favorites: HashSet<String>,
+    metrics_sampler: MetricsSampler,
+    metrics: MetricsSnapshot,
     filter: String,
     prompt: Option<Prompt>,
     confirm: Option<Confirm>,
@@ -125,9 +131,11 @@ impl App {
             selected: 0,
             detail_scroll: 0,
             help_scroll: 0,
-            collapsed_sessions: HashSet::new(),
-            collapsed_windows: HashSet::new(),
+            expanded_sessions: HashSet::new(),
+            expanded_windows: HashSet::new(),
             favorites: load_favorites(),
+            metrics_sampler: MetricsSampler::new(),
+            metrics: MetricsSnapshot::default(),
             filter: String::new(),
             prompt: None,
             confirm: None,
@@ -227,6 +235,14 @@ impl App {
 
     pub fn counts(&self) -> (usize, usize, usize) {
         self.state.counts()
+    }
+
+    pub fn system_metrics(&self) -> &SystemMetrics {
+        &self.metrics.system
+    }
+
+    pub fn cpu_metrics_ready(&self) -> bool {
+        self.metrics.cpu_ready
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -403,6 +419,10 @@ impl App {
     fn refresh(&mut self) {
         match self.client.load() {
             Ok(state) => {
+                let pane_pids = pane_pids(&state);
+                self.metrics = self
+                    .metrics_sampler
+                    .sample(pane_pids.iter().map(String::as_str));
                 self.state = state;
                 self.rebuild_items();
                 self.status = self
@@ -449,8 +469,11 @@ impl App {
     }
 
     fn push_unfiltered_session(&self, items: &mut Vec<TreeItem>, session: &Session) {
-        items.push(self.decorate_item(session_item(session)));
-        if self.collapsed_sessions.contains(&session.id) {
+        items.push(self.decorate_item(
+            session_item(session),
+            Some(self.expanded_sessions.contains(&session.id)),
+        ));
+        if !self.expanded_sessions.contains(&session.id) {
             return;
         }
 
@@ -462,8 +485,11 @@ impl App {
         });
 
         for window in windows {
-            items.push(self.decorate_item(window_item(session, window)));
-            if self.collapsed_windows.contains(&window.id) {
+            items.push(self.decorate_item(
+                window_item(session, window),
+                Some(self.expanded_windows.contains(&window.id)),
+            ));
+            if !self.expanded_windows.contains(&window.id) {
                 continue;
             }
 
@@ -475,13 +501,13 @@ impl App {
             });
 
             for pane in panes {
-                items.push(self.decorate_item(pane_item(session, window, pane)));
+                items.push(self.decorate_item(pane_item(session, window, pane), None));
             }
         }
     }
 
     fn push_filtered_session(&self, items: &mut Vec<TreeItem>, session: &Session, filter: &str) {
-        let session_item = self.decorate_item(session_item(session));
+        let session_item = self.decorate_item(session_item(session), Some(true));
         let session_match = matches_filter(&session_item, filter);
         let mut block = Vec::new();
 
@@ -493,7 +519,7 @@ impl App {
         });
 
         for window in windows {
-            let window_item = self.decorate_item(window_item(session, window));
+            let window_item = self.decorate_item(window_item(session, window), Some(true));
             let window_match = matches_filter(&window_item, filter);
             let mut pane_block = Vec::new();
 
@@ -505,7 +531,7 @@ impl App {
             });
 
             for pane in panes {
-                let pane_item = self.decorate_item(pane_item(session, window, pane));
+                let pane_item = self.decorate_item(pane_item(session, window, pane), None);
                 if session_match || window_match || matches_filter(&pane_item, filter) {
                     pane_block.push(pane_item);
                 }
@@ -523,11 +549,13 @@ impl App {
         }
     }
 
-    fn decorate_item(&self, mut item: TreeItem) -> TreeItem {
+    fn decorate_item(&self, mut item: TreeItem, expanded: Option<bool>) -> TreeItem {
+        item.expanded = expanded;
         item.favorite = self.favorites.contains(&item.favorite_key);
         if item.favorite {
             item.label = format!("* {}", item.label);
         }
+        self.append_resource_details(&mut item);
         item.details
             .push(("Favorite".into(), item.favorite.to_string()));
         item
@@ -615,11 +643,11 @@ impl App {
 
         match item.kind {
             TreeItemKind::Session => {
-                toggle_set(&mut self.collapsed_sessions, item.target.session_id)
+                toggle_set(&mut self.expanded_sessions, item.target.session_id)
             }
             TreeItemKind::Window => {
                 if let Some(window_id) = item.target.window_id {
-                    toggle_set(&mut self.collapsed_windows, window_id);
+                    toggle_set(&mut self.expanded_windows, window_id);
                 }
             }
             TreeItemKind::Pane => {}
@@ -634,11 +662,11 @@ impl App {
 
         match item.kind {
             TreeItemKind::Session => {
-                self.collapsed_sessions.insert(item.target.session_id);
+                self.expanded_sessions.remove(&item.target.session_id);
             }
             TreeItemKind::Window => {
                 if let Some(window_id) = item.target.window_id {
-                    self.collapsed_windows.insert(window_id);
+                    self.expanded_windows.remove(&window_id);
                 }
             }
             TreeItemKind::Pane => {}
@@ -653,11 +681,11 @@ impl App {
 
         match item.kind {
             TreeItemKind::Session => {
-                self.collapsed_sessions.remove(&item.target.session_id);
+                self.expanded_sessions.insert(item.target.session_id);
             }
             TreeItemKind::Window => {
                 if let Some(window_id) = item.target.window_id {
-                    self.collapsed_windows.remove(&window_id);
+                    self.expanded_windows.insert(window_id);
                 }
             }
             TreeItemKind::Pane => {}
@@ -1000,6 +1028,139 @@ impl App {
         let (sessions, windows, panes) = self.counts();
         format!("{prefix}: {sessions} sessions, {windows} windows, {panes} panes")
     }
+
+    fn append_resource_details(&self, item: &mut TreeItem) {
+        let summary = self.resource_summary_for_target(&item.target);
+        if item.kind == TreeItemKind::Pane {
+            item.details.push((
+                "Process tree CPU".into(),
+                summary
+                    .metrics
+                    .as_ref()
+                    .map(|metrics| format_cpu_usage(metrics.cpu_usage, self.metrics.cpu_ready))
+                    .unwrap_or_else(|| "unavailable".into()),
+            ));
+            item.details.push((
+                "Process tree memory".into(),
+                summary
+                    .metrics
+                    .as_ref()
+                    .map(|metrics| format_bytes(metrics.memory_bytes))
+                    .unwrap_or_else(|| "unavailable".into()),
+            ));
+            item.details.push((
+                "Process tree processes".into(),
+                summary
+                    .metrics
+                    .as_ref()
+                    .map(|metrics| metrics.process_count.to_string())
+                    .unwrap_or_else(|| "0".into()),
+            ));
+            return;
+        }
+
+        item.details.push((
+            "Aggregate CPU".into(),
+            summary
+                .metrics
+                .as_ref()
+                .map(|metrics| format_cpu_usage(metrics.cpu_usage, self.metrics.cpu_ready))
+                .unwrap_or_else(|| "unavailable".into()),
+        ));
+        item.details.push((
+            "Aggregate memory".into(),
+            summary
+                .metrics
+                .as_ref()
+                .map(|metrics| format_bytes(metrics.memory_bytes))
+                .unwrap_or_else(|| "unavailable".into()),
+        ));
+        item.details.push((
+            "Tracked panes".into(),
+            format!("{}/{}", summary.tracked_panes, summary.total_panes),
+        ));
+        item.details.push((
+            "Tracked processes".into(),
+            summary
+                .metrics
+                .as_ref()
+                .map(|metrics| metrics.process_count.to_string())
+                .unwrap_or_else(|| "0".into()),
+        ));
+    }
+
+    fn resource_summary_for_target(&self, target: &TmuxTarget) -> ResourceSummary {
+        let mut summary = ResourceSummary::default();
+        for session in &self.state.sessions {
+            if session.id != target.session_id || session.server.label() != target.server_label() {
+                continue;
+            }
+
+            match (&target.window_id, &target.pane_id) {
+                (_, Some(pane_id)) => {
+                    for pane in session.windows.iter().flat_map(|window| &window.panes) {
+                        if pane.id == *pane_id {
+                            summary.add_pane(pane, &self.metrics);
+                            return summary;
+                        }
+                    }
+                }
+                (Some(window_id), None) => {
+                    for window in &session.windows {
+                        if window.id == *window_id {
+                            for pane in &window.panes {
+                                summary.add_pane(pane, &self.metrics);
+                            }
+                            return summary;
+                        }
+                    }
+                }
+                (None, None) => {
+                    for pane in session.windows.iter().flat_map(|window| &window.panes) {
+                        summary.add_pane(pane, &self.metrics);
+                    }
+                    return summary;
+                }
+            }
+        }
+        summary
+    }
+}
+
+#[derive(Default)]
+struct ResourceSummary {
+    metrics: Option<ProcessMetrics>,
+    total_panes: usize,
+    tracked_panes: usize,
+}
+
+impl ResourceSummary {
+    fn add_pane(&mut self, pane: &Pane, snapshot: &MetricsSnapshot) {
+        self.total_panes = self.total_panes.saturating_add(1);
+        if let Some(metrics) = snapshot.panes.get(&pane.pid) {
+            self.tracked_panes = self.tracked_panes.saturating_add(1);
+            self.metrics
+                .get_or_insert_with(ProcessMetrics::default)
+                .add(metrics);
+        }
+    }
+}
+
+fn pane_pids(state: &TmuxState) -> Vec<String> {
+    state
+        .sessions
+        .iter()
+        .flat_map(|session| &session.windows)
+        .flat_map(|window| &window.panes)
+        .filter_map(|pane| {
+            let pid = pane.pid.trim();
+            if pid.is_empty() {
+                None
+            } else {
+                Some(pid.to_string())
+            }
+        })
+        .collect()
 }
 
 fn session_item(session: &Session) -> TreeItem {
@@ -1063,6 +1224,7 @@ fn session_item(session: &Session) -> TreeItem {
                 false,
             )
         }),
+        expanded: None,
         active: session.attached,
         dead: false,
     }
@@ -1124,6 +1286,7 @@ fn window_item(session: &Session, window: &Window) -> TreeItem {
             window,
             false,
         )),
+        expanded: None,
         active: window.active,
         dead: false,
     }
@@ -1193,6 +1356,7 @@ fn pane_item(session: &Session, window: &Window, pane: &Pane) -> TreeItem {
             title: format!("Pane {} - {}", pane.index, name),
             panes: vec![pane_preview(pane, true)],
         }),
+        expanded: None,
         active: pane.active,
         dead: pane.dead,
     }
@@ -1439,5 +1603,104 @@ mod tests {
     fn fuzzy_matches_ordered_characters() {
         assert!(fuzzy_match("openai_dashboard", "oad"));
         assert!(!fuzzy_match("logging", "zg"));
+    }
+
+    #[test]
+    fn starts_with_sessions_and_windows_collapsed() {
+        let mut app = app_with_sample_state();
+
+        app.rebuild_items();
+
+        assert_eq!(app.items.len(), 1);
+        assert_eq!(app.items[0].kind, TreeItemKind::Session);
+        assert_eq!(app.items[0].expanded, Some(false));
+
+        app.expand_selected();
+        assert_eq!(app.items.len(), 2);
+        assert_eq!(app.items[1].kind, TreeItemKind::Window);
+        assert_eq!(app.items[1].expanded, Some(false));
+
+        app.select_index(1);
+        app.expand_selected();
+        assert_eq!(app.items.len(), 3);
+        assert_eq!(app.items[2].kind, TreeItemKind::Pane);
+    }
+
+    #[test]
+    fn filter_reveals_matching_descendants_even_when_collapsed() {
+        let mut app = app_with_sample_state();
+        app.filter = "nvim".into();
+
+        app.rebuild_items();
+
+        assert_eq!(app.items.len(), 3);
+        assert_eq!(app.items[0].kind, TreeItemKind::Session);
+        assert_eq!(app.items[1].kind, TreeItemKind::Window);
+        assert_eq!(app.items[2].kind, TreeItemKind::Pane);
+    }
+
+    #[test]
+    fn appends_resource_metrics_to_details() {
+        let mut app = app_with_sample_state();
+        app.metrics.cpu_ready = true;
+        app.metrics.panes.insert(
+            "123".into(),
+            ProcessMetrics {
+                cpu_usage: 12.5,
+                memory_bytes: 2048,
+                process_count: 3,
+            },
+        );
+
+        app.rebuild_items();
+
+        assert!(app.items[0]
+            .details
+            .contains(&("Aggregate CPU".into(), "12.5%".into())));
+        assert!(app.items[0]
+            .details
+            .contains(&("Tracked processes".into(), "3".into())));
+    }
+
+    fn app_with_sample_state() -> App {
+        let mut app = App::with_client(Duration::from_secs(1), TmuxClient::default());
+        app.state = TmuxState {
+            sessions: vec![Session {
+                server: crate::tmux::TmuxServer::Default,
+                id: "$1".into(),
+                name: "dev".into(),
+                attached: false,
+                created: Some(1_700_000_000),
+                window_count: Some(1),
+                windows: vec![Window {
+                    id: "@1".into(),
+                    index: "0".into(),
+                    name: "editor".into(),
+                    active: true,
+                    pane_count: Some(1),
+                    layout: "layout".into(),
+                    flags: "*".into(),
+                    panes: vec![Pane {
+                        id: "%1".into(),
+                        index: "0".into(),
+                        active: true,
+                        command: "nvim".into(),
+                        path: "/tmp".into(),
+                        title: "editor".into(),
+                        left: Some(0),
+                        top: Some(0),
+                        width: Some(120),
+                        height: Some(40),
+                        pid: "123".into(),
+                        dead: false,
+                        in_mode: false,
+                        content: String::new(),
+                    }],
+                }],
+            }],
+            notice: None,
+            diagnostics: Vec::new(),
+        };
+        app
     }
 }
