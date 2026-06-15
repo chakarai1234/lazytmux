@@ -368,6 +368,17 @@ fn draw_prompt(frame: &mut Frame, area: Rect, title: &str, value: &str, hint: &s
     )
     .wrap(Wrap { trim: false });
     frame.render_widget(prompt, popup);
+
+    // Place the terminal cursor at the end of the typed value so it stays
+    // visible while creating or renaming. ratatui hides the hardware cursor on
+    // every frame unless we explicitly position it here.
+    let inner_width = popup.width.saturating_sub(2);
+    if inner_width > 0 {
+        let typed = value.chars().count() as u16;
+        let cursor_x = popup.x + 1 + typed.min(inner_width - 1);
+        let cursor_y = popup.y + 1;
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
 }
 
 fn draw_confirm(frame: &mut Frame, area: Rect, message: &str) {
