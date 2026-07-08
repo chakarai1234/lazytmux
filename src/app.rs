@@ -62,7 +62,84 @@ pub struct Prompt {
     pub title: String,
     pub value: String,
     pub hint: String,
+    /// Byte offset of the caret within `value`. Always kept on a UTF-8
+    /// character boundary so the string operations below never panic.
+    pub cursor: usize,
     kind: PromptKind,
+}
+
+impl Prompt {
+    /// Build a prompt with the caret positioned at the end of `value`, which is
+    /// what every entry point wants (either an empty field, or an existing name
+    /// the user is about to edit).
+    fn new(title: String, value: String, hint: String, kind: PromptKind) -> Self {
+        let cursor = value.len();
+        Self {
+            title,
+            value,
+            hint,
+            cursor,
+            kind,
+        }
+    }
+
+    /// Insert a character at the caret and advance past it.
+    fn insert_char(&mut self, character: char) {
+        self.value.insert(self.cursor, character);
+        self.cursor += character.len_utf8();
+    }
+
+    /// Delete the character immediately before the caret (Backspace).
+    fn delete_backward(&mut self) {
+        if let Some((offset, _)) = self.value[..self.cursor].char_indices().next_back() {
+            self.value.remove(offset);
+            self.cursor = offset;
+        }
+    }
+
+    /// Delete the character at the caret (Delete key). The caret does not move.
+    fn delete_forward(&mut self) {
+        if self.cursor < self.value.len() {
+            self.value.remove(self.cursor);
+        }
+    }
+
+    /// Move the caret one character to the left.
+    fn move_left(&mut self) {
+        if let Some((offset, _)) = self.value[..self.cursor].char_indices().next_back() {
+            self.cursor = offset;
+        }
+    }
+
+    /// Move the caret one character to the right.
+    fn move_right(&mut self) {
+        if let Some(character) = self.value[self.cursor..].chars().next() {
+            self.cursor += character.len_utf8();
+        }
+    }
+
+    /// Jump the caret to the start of the line.
+    fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Jump the caret to the end of the line.
+    fn move_end(&mut self) {
+        self.cursor = self.value.len();
+    }
+
+    /// Clear the whole line and reset the caret (Ctrl-U).
+    fn clear(&mut self) {
+        self.value.clear();
+        self.cursor = 0;
+    }
+
+    /// Number of characters (not bytes) before the caret. The renderer uses
+    /// this to place the terminal cursor, since screen columns count
+    /// characters, not UTF-8 bytes.
+    pub fn cursor_char_index(&self) -> usize {
+        self.value[..self.cursor].chars().count()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -386,17 +463,52 @@ impl App {
             }
             KeyCode::Backspace => {
                 if let Some(prompt) = self.prompt.as_mut() {
-                    prompt.value.pop();
+                    prompt.delete_backward();
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.delete_forward();
+                }
+            }
+            KeyCode::Left => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.move_left();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.move_right();
+                }
+            }
+            KeyCode::Home => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.move_home();
+                }
+            }
+            KeyCode::End => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.move_end();
+                }
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.move_home();
+                }
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.move_end();
                 }
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(prompt) = self.prompt.as_mut() {
-                    prompt.value.clear();
+                    prompt.clear();
                 }
             }
             KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(prompt) = self.prompt.as_mut() {
-                    prompt.value.push(character);
+                    prompt.insert_char(character);
                 }
             }
             _ => {}
@@ -711,12 +823,12 @@ impl App {
     }
 
     fn open_filter_prompt(&mut self) {
-        self.prompt = Some(Prompt {
-            title: "Filter".into(),
-            value: self.filter.clone(),
-            hint: "Enter to apply, Esc to cancel, Ctrl-U to clear".into(),
-            kind: PromptKind::Filter,
-        });
+        self.prompt = Some(Prompt::new(
+            "Filter".into(),
+            self.filter.clone(),
+            "Enter to apply, Esc to cancel, Ctrl-U to clear".into(),
+            PromptKind::Filter,
+        ));
     }
 
     fn clear_filter(&mut self) {
@@ -726,21 +838,21 @@ impl App {
     }
 
     fn open_new_session_prompt(&mut self) {
-        self.prompt = Some(Prompt {
-            title: "New session".into(),
-            value: "".into(),
-            hint: "Enter a tmux session name".into(),
-            kind: PromptKind::NewSession,
-        });
+        self.prompt = Some(Prompt::new(
+            "New session".into(),
+            "".into(),
+            "Enter a tmux session name".into(),
+            PromptKind::NewSession,
+        ));
     }
 
     fn open_launch_session_prompt(&mut self) {
-        self.prompt = Some(Prompt {
-            title: "Launch session".into(),
-            value: "".into(),
-            hint: "Format: name | start-dir | command. Only name is required.".into(),
-            kind: PromptKind::LaunchSession,
-        });
+        self.prompt = Some(Prompt::new(
+            "Launch session".into(),
+            "".into(),
+            "Format: name | start-dir | command. Only name is required.".into(),
+            PromptKind::LaunchSession,
+        ));
     }
 
     fn open_new_window_prompt(&mut self) {
@@ -749,14 +861,14 @@ impl App {
             return;
         };
 
-        self.prompt = Some(Prompt {
-            title: "New window".into(),
-            value: "".into(),
-            hint: "Enter a window name".into(),
-            kind: PromptKind::NewWindow {
+        self.prompt = Some(Prompt::new(
+            "New window".into(),
+            "".into(),
+            "Enter a window name".into(),
+            PromptKind::NewWindow {
                 target: item.target.clone(),
             },
-        });
+        ));
     }
 
     fn split_selected(&mut self, direction: SplitDirection) {
@@ -803,12 +915,12 @@ impl App {
             ),
         };
 
-        self.prompt = Some(Prompt {
-            title: title.into(),
+        self.prompt = Some(Prompt::new(
+            title.into(),
             value,
-            hint: "Enter to apply, Esc to cancel".into(),
+            "Left/Right to move, Enter to apply, Esc to cancel".into(),
             kind,
-        });
+        ));
     }
 
     fn open_kill_confirm(&mut self) {
@@ -859,12 +971,12 @@ impl App {
             return;
         };
 
-        self.prompt = Some(Prompt {
-            title: "Send keys".into(),
-            value: "".into(),
-            hint: "Text is sent to the pane followed by Enter".into(),
-            kind: PromptKind::SendKeys { target },
-        });
+        self.prompt = Some(Prompt::new(
+            "Send keys".into(),
+            "".into(),
+            "Text is sent to the pane followed by Enter".into(),
+            PromptKind::SendKeys { target },
+        ));
     }
 
     fn copy_selected_pane(&mut self) {
@@ -903,12 +1015,12 @@ impl App {
     }
 
     fn open_command_prompt(&mut self) {
-        self.prompt = Some(Prompt {
-            title: "tmux command".into(),
-            value: "".into(),
-            hint: "Example: rename-session work. Do not include the leading tmux word.".into(),
-            kind: PromptKind::Command,
-        });
+        self.prompt = Some(Prompt::new(
+            "tmux command".into(),
+            "".into(),
+            "Example: rename-session work. Do not include the leading tmux word.".into(),
+            PromptKind::Command,
+        ));
     }
 
     fn apply_prompt(&mut self, prompt: Prompt) -> Result<()> {
@@ -1587,6 +1699,93 @@ mod tests {
     fn rejects_leading_tmux_word() {
         let error = split_tmux_args("tmux list-sessions").unwrap_err();
         assert!(error.to_string().contains("omit"));
+    }
+
+    fn sample_prompt(value: &str) -> Prompt {
+        Prompt::new(
+            "Test".into(),
+            value.into(),
+            "hint".into(),
+            PromptKind::NewSession,
+        )
+    }
+
+    #[test]
+    fn prompt_starts_with_caret_at_end() {
+        let prompt = sample_prompt("work");
+        assert_eq!(prompt.cursor, 4);
+        assert_eq!(prompt.cursor_char_index(), 4);
+    }
+
+    #[test]
+    fn prompt_inserts_at_caret() {
+        let mut prompt = sample_prompt("wrk");
+        prompt.move_home();
+        prompt.move_right(); // caret after 'w'
+        prompt.insert_char('o');
+        assert_eq!(prompt.value, "work");
+        assert_eq!(prompt.cursor_char_index(), 2);
+    }
+
+    #[test]
+    fn prompt_backspace_deletes_before_caret() {
+        let mut prompt = sample_prompt("work");
+        prompt.move_left(); // caret between 'r' and 'k'
+        prompt.delete_backward();
+        assert_eq!(prompt.value, "wok");
+        assert_eq!(prompt.cursor_char_index(), 2);
+    }
+
+    #[test]
+    fn prompt_delete_removes_at_caret() {
+        let mut prompt = sample_prompt("work");
+        prompt.move_home();
+        prompt.delete_forward();
+        assert_eq!(prompt.value, "ork");
+        assert_eq!(prompt.cursor_char_index(), 0);
+    }
+
+    #[test]
+    fn prompt_arrows_clamp_at_boundaries() {
+        let mut prompt = sample_prompt("hi");
+        prompt.move_home();
+        prompt.move_left(); // already at start, must not underflow
+        assert_eq!(prompt.cursor, 0);
+        prompt.move_end();
+        prompt.move_right(); // already at end, must not overrun
+        assert_eq!(prompt.cursor, prompt.value.len());
+    }
+
+    #[test]
+    fn prompt_home_end_jump_to_edges() {
+        let mut prompt = sample_prompt("session");
+        prompt.move_home();
+        assert_eq!(prompt.cursor_char_index(), 0);
+        prompt.move_end();
+        assert_eq!(prompt.cursor_char_index(), 7);
+    }
+
+    #[test]
+    fn prompt_clear_resets_value_and_caret() {
+        let mut prompt = sample_prompt("something");
+        prompt.clear();
+        assert_eq!(prompt.value, "");
+        assert_eq!(prompt.cursor, 0);
+    }
+
+    #[test]
+    fn prompt_handles_multibyte_characters() {
+        // Each of these characters is more than one byte, so byte-based caret
+        // math must stay on character boundaries or these would panic.
+        let mut prompt = sample_prompt("café");
+        assert_eq!(prompt.cursor_char_index(), 4);
+        prompt.delete_backward(); // remove 'é'
+        assert_eq!(prompt.value, "caf");
+        prompt.move_home();
+        prompt.move_right();
+        prompt.insert_char('ñ');
+        assert_eq!(prompt.value, "cñaf");
+        assert_eq!(prompt.cursor_char_index(), 2);
     }
 
     #[test]

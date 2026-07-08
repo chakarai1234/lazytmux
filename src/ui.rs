@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, TerminalPanePreview, TerminalPreview, TreeItem, TreeItemKind};
+use crate::app::{App, Prompt, TerminalPanePreview, TerminalPreview, TreeItem, TreeItemKind};
 use crate::metrics::{format_cpu_usage, format_memory_usage, SystemMetrics};
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -35,7 +35,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 
     if let Some(prompt) = app.prompt() {
-        draw_prompt(frame, area, &prompt.title, &prompt.value, &prompt.hint);
+        draw_prompt(frame, area, prompt);
     }
 }
 
@@ -348,34 +348,52 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(status, area);
 }
 
-fn draw_prompt(frame: &mut Frame, area: Rect, title: &str, value: &str, hint: &str) {
+fn draw_prompt(frame: &mut Frame, area: Rect, prompt: &Prompt) {
     let popup = centered_rect(70, 25, area);
     frame.render_widget(Clear, popup);
 
-    let prompt = Paragraph::new(vec![
-        Line::from(value.to_string()),
+    // The editable line lives inside the border, so it has two fewer columns
+    // than the popup. When the value is longer than that width we scroll a
+    // window across it, keeping the caret in view like a real terminal input.
+    let inner_width = popup.width.saturating_sub(2) as usize;
+    let caret = prompt.cursor_char_index();
+    let chars: Vec<char> = prompt.value.chars().collect();
+
+    // First visible character. Scroll only once the caret would fall off the
+    // right edge; before that we always start at the beginning of the line.
+    let scroll = if inner_width == 0 {
+        0
+    } else {
+        caret.saturating_sub(inner_width.saturating_sub(1))
+    };
+
+    let visible: String = chars.iter().skip(scroll).take(inner_width.max(1)).collect();
+
+    let prompt_widget = Paragraph::new(vec![
+        Line::from(visible),
         Line::from(""),
         Line::from(Span::styled(
-            hint.to_string(),
+            prompt.hint.clone(),
             Style::default().fg(Color::DarkGray),
         )),
     ])
     .block(
         Block::default()
-            .title(title)
+            .title(prompt.title.clone())
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan)),
     )
+    // Do not wrap: the input is a single scrolling line, so wrapping would
+    // push the caret math out of sync with what is drawn.
     .wrap(Wrap { trim: false });
-    frame.render_widget(prompt, popup);
+    frame.render_widget(prompt_widget, popup);
 
-    // Place the terminal cursor at the end of the typed value so it stays
-    // visible while creating or renaming. ratatui hides the hardware cursor on
-    // every frame unless we explicitly position it here.
-    let inner_width = popup.width.saturating_sub(2);
+    // Place the terminal cursor at the caret. ratatui hides the hardware cursor
+    // on every frame unless we explicitly position it here. The column is the
+    // caret's offset within the currently visible window.
     if inner_width > 0 {
-        let typed = value.chars().count() as u16;
-        let cursor_x = popup.x + 1 + typed.min(inner_width - 1);
+        let column = (caret - scroll) as u16;
+        let cursor_x = popup.x + 1 + column;
         let cursor_y = popup.y + 1;
         frame.set_cursor_position((cursor_x, cursor_y));
     }
