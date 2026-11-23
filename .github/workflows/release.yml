@@ -1,10 +1,19 @@
-name: Release
+name: Build and Release
 
 on:
+  push:
+    branches:
+      - main
+    tags:
+      - "[0-9]*.[0-9]*.[0-9]*"
+      - "v[0-9]*.[0-9]*.[0-9]*"
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create, for example v0.1.0"
+        description: "Release tag to create, for example 0.1.4"
         required: true
         type: string
       prerelease:
@@ -88,6 +97,7 @@ jobs:
   release:
     name: Create GitHub release
     runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
     needs:
       - build-linux
       - build-macos
@@ -101,20 +111,42 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Create GitHub release
+      - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ inputs.tag }}
-          PRERELEASE: ${{ inputs.prerelease }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
         run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            RELEASE_TAG="$INPUT_TAG"
+            PRERELEASE="$INPUT_PRERELEASE"
+          else
+            RELEASE_TAG="$REF_NAME"
+            case "$RELEASE_TAG" in
+              *-*) PRERELEASE="true" ;;
+              *) PRERELEASE="false" ;;
+            esac
+          fi
+
           prerelease_args=""
           if [ "$PRERELEASE" = "true" ]; then
             prerelease_args="--prerelease"
           fi
 
-          gh release create "$RELEASE_TAG" dist/*.tar.gz \
-            --target "$GITHUB_SHA" \
-            --title "$RELEASE_TAG" \
-            --generate-notes \
-            $prerelease_args
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/*.tar.gz --clobber
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            gh release create "$RELEASE_TAG" dist/*.tar.gz \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TAG" \
+              --generate-notes \
+              $prerelease_args
+          else
+            gh release create "$RELEASE_TAG" dist/*.tar.gz \
+              --title "$RELEASE_TAG" \
+              --generate-notes \
+              $prerelease_args
+          fi

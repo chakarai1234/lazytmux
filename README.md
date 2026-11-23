@@ -93,14 +93,17 @@ For macOS, replace the archive and directory names with
 
 ## Release
 
-Releases are created manually from the GitHub Actions `Release` workflow.
+Every push and pull request to `main` automatically runs tests and builds both
+Linux (`x86_64`) and macOS universal (`x86_64` + `aarch64`) packages via GitHub
+Actions.
 
-1. Update `Cargo.toml` with the release version and commit the change.
-2. Push the commit to the release branch, normally `main`.
-3. Open GitHub Actions, select `Release`, then choose `Run workflow`.
-4. Enter a tag such as `v0.2.0` and choose whether it is a prerelease.
-5. Run the workflow and wait for the Linux (`x86_64`) and macOS universal (`x86_64` + `aarch64`) build jobs to finish.
-6. Confirm the GitHub release contains `lazytmux-linux-x86_64.tar.gz` and
+To publish a GitHub release:
+
+1. Update `Cargo.toml` and `Cargo.lock` with the release version and push to `main`.
+2. Push a version tag such as `0.1.4` (`git tag 0.1.4 && git push origin 0.1.4`),
+   or trigger the `Build and Release` workflow manually from GitHub Actions.
+3. Wait for `build-linux`, `build-macos`, and `release` jobs to finish and verify
+   the release contains `lazytmux-linux-x86_64.tar.gz` and
    `lazytmux-macos-universal.tar.gz`.
 
 ## Shortcuts

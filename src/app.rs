@@ -4064,7 +4064,7 @@ mod tests {
                 pid: "124".into(),
                 dead: false,
                 in_mode: false,
-                content: "\x1b[32m   Compiling\x1b[0m lazytmux v0.1.3\n\x1b[32m    Finished\x1b[0m release in 4.2s".into(),
+                content: "\x1b[32m   Compiling\x1b[0m lazytmux v0.1.4\n\x1b[32m    Finished\x1b[0m release in 4.2s".into(),
             },
             Pane {
                 id: "%3".into(),
