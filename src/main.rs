@@ -1,5 +1,8 @@
+mod ansi;
 mod app;
+mod keybindings;
 mod metrics;
+mod theme;
 mod tmux;
 mod ui;
 
@@ -8,7 +11,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use app::App;
+use app::{App, ViewMode};
 use clap::Parser;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
@@ -17,16 +20,36 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use theme::ThemeId;
 use tmux::{TmuxClient, TmuxClientOptions};
 
 #[derive(Debug, Parser)]
-#[command(author, version, about)]
+#[command(
+    author,
+    version,
+    about = "Futuristic Cyber-Deck TUI framework & controller for tmux"
+)]
 struct Cli {
     #[arg(long, default_value_t = 2, help = "Auto-refresh interval in seconds")]
     refresh_seconds: u64,
 
     #[arg(long, help = "Disable mouse capture")]
     no_mouse: bool,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Override UI theme (cyber, aurora, solaris, matrix, frost)"
+    )]
+    theme: Option<ThemeId>,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = ViewMode::Deck,
+        help = "Initial inspector deck (deck, live, telemetry, buffers)"
+    )]
+    view: ViewMode,
 
     #[arg(
         short = 'S',
@@ -66,11 +89,15 @@ impl Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    install_panic_hook(cli.no_mouse);
+
     let tmux_options = cli.tmux_options();
     let mut terminal = setup_terminal(cli.no_mouse)?;
-    let mut app = App::with_client(
+    let mut app = App::with_options(
         Duration::from_secs(cli.refresh_seconds.max(1)),
         TmuxClient::with_options(tmux_options),
+        cli.theme,
+        cli.view,
     );
 
     let run_result = app.run(&mut terminal);
@@ -85,6 +112,20 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn install_panic_hook(no_mouse: bool) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        if no_mouse {
+            let _ = execute!(stdout, LeaveAlternateScreen);
+        } else {
+            let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+        }
+        previous(panic_info);
+    }));
 }
 
 fn setup_terminal(no_mouse: bool) -> Result<Terminal<CrosstermBackend<Stdout>>> {

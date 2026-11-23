@@ -2,16 +2,16 @@ use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use anyhow::{anyhow, Context, Result};
 
 const PRIMARY_SEP: char = '\u{1f}';
 const FALLBACK_SEP: char = '\t';
 const REQUIRED_FIELD_COUNT: usize = 23;
-const TMUX_FIELDS: [&str; 25] = [
+const TMUX_FIELDS: [&str; 29] = [
     "session_id",
     "session_name",
     "session_attached",
@@ -37,6 +37,10 @@ const TMUX_FIELDS: [&str; 25] = [
     "pane_pid",
     "pane_dead",
     "pane_in_mode",
+    "window_zoomed_flag",
+    "pane_synchronized",
+    "pane_marked",
+    "session_activity",
 ];
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -68,9 +72,20 @@ impl TmuxServer {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TmuxBuffer {
+    pub server: TmuxServer,
+    pub name: String,
+    pub size: usize,
+    pub sample: String,
+    pub content: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TmuxState {
     pub sessions: Vec<Session>,
+    pub buffers: Vec<TmuxBuffer>,
+    pub version: Option<String>,
     pub notice: Option<String>,
     pub diagnostics: Vec<String>,
 }
@@ -90,6 +105,15 @@ impl TmuxState {
             .sum();
         (self.sessions.len(), windows, panes)
     }
+
+    pub fn server_count(&self) -> usize {
+        let servers: HashSet<String> = self
+            .sessions
+            .iter()
+            .map(|session| session.server.label())
+            .collect();
+        servers.len()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,6 +123,7 @@ pub struct Session {
     pub name: String,
     pub attached: bool,
     pub created: Option<i64>,
+    pub activity: Option<i64>,
     pub window_count: Option<usize>,
     pub windows: Vec<Window>,
 }
@@ -109,6 +134,8 @@ pub struct Window {
     pub index: String,
     pub name: String,
     pub active: bool,
+    pub zoomed: bool,
+    pub synchronized: bool,
     pub pane_count: Option<usize>,
     pub layout: String,
     pub flags: String,
@@ -120,6 +147,7 @@ pub struct Pane {
     pub id: String,
     pub index: String,
     pub active: bool,
+    pub marked: bool,
     pub command: String,
     pub path: String,
     pub title: String,
@@ -210,6 +238,103 @@ pub enum SplitDirection {
     Vertical,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResizeDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TmuxLayout {
+    EvenHorizontal,
+    EvenVertical,
+    MainHorizontal,
+    MainVertical,
+    Tiled,
+}
+
+impl TmuxLayout {
+    pub const ALL: [TmuxLayout; 5] = [
+        TmuxLayout::EvenHorizontal,
+        TmuxLayout::EvenVertical,
+        TmuxLayout::MainHorizontal,
+        TmuxLayout::MainVertical,
+        TmuxLayout::Tiled,
+    ];
+
+    pub fn tmux_name(self) -> &'static str {
+        match self {
+            Self::EvenHorizontal => "even-horizontal",
+            Self::EvenVertical => "even-vertical",
+            Self::MainHorizontal => "main-horizontal",
+            Self::MainVertical => "main-vertical",
+            Self::Tiled => "tiled",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EvenHorizontal => "Even Horizontal",
+            Self::EvenVertical => "Even Vertical",
+            Self::MainHorizontal => "Main Horizontal",
+            Self::MainVertical => "Main Vertical",
+            Self::Tiled => "Balanced Tiled",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::EvenHorizontal => "Equal-width side-by-side vertical columns",
+            Self::EvenVertical => "Equal-height stacked horizontal rows",
+            Self::MainHorizontal => "Large hero pane on top, stacked strip below",
+            Self::MainVertical => "Large hero pane on left, stacked column right",
+            Self::Tiled => "Symmetric grid automatically balanced across panes",
+        }
+    }
+
+    pub fn diagram(self) -> [&'static str; 5] {
+        match self {
+            Self::EvenHorizontal => [
+                "┌───┬───┬───┐",
+                "│ 0 │ 1 │ 2 │",
+                "│   │   │   │",
+                "│   │   │   │",
+                "└───┴───┴───┘",
+            ],
+            Self::EvenVertical => [
+                "┌───────────┐",
+                "│     0     │",
+                "├───────────┤",
+                "│     1     │",
+                "└───────────┘",
+            ],
+            Self::MainHorizontal => [
+                "┌───────────┐",
+                "│   MAIN    │",
+                "├─────┬─────┤",
+                "│  1  │  2  │",
+                "└─────┴─────┘",
+            ],
+            Self::MainVertical => [
+                "┌──────┬────┐",
+                "│      │ 1  │",
+                "│ MAIN ├────┤",
+                "│      │ 2  │",
+                "└──────┴────┘",
+            ],
+            Self::Tiled => [
+                "┌─────┬─────┐",
+                "│  0  │  1  │",
+                "├─────┼─────┤",
+                "│  2  │  3  │",
+                "└─────┴─────┘",
+            ],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct TmuxClientOptions {
     pub socket_paths: Vec<PathBuf>,
@@ -267,10 +392,12 @@ impl TmuxClient {
         let mut empty_server = None;
         let mut primary_server = None;
         let mut loaded_servers = HashSet::new();
+        let mut active_servers = Vec::new();
         let mut sessions = Vec::new();
         let candidates = candidate_servers(&self.server, &self.extra_servers, &self.socket_dirs);
         let mut diagnostics = vec![format!("Candidate servers: {}", candidates.len())];
         let fallback_server = candidates.first().cloned().unwrap_or(TmuxServer::Default);
+        let version = detect_tmux_version();
 
         for server in candidates {
             let server_label = server.label();
@@ -305,6 +432,7 @@ impl TmuxClient {
                 state.sessions.len()
             ));
             primary_server.get_or_insert_with(|| server.clone());
+            active_servers.push(server);
             sessions.extend(state.sessions);
         }
 
@@ -312,12 +440,18 @@ impl TmuxClient {
             "tmux process running: {}",
             tmux_processes_running()
         ));
+        if let Some(ref ver) = version {
+            diagnostics.push(format!("tmux binary version: {ver}"));
+        }
 
         if !sessions.is_empty() {
             self.server = primary_server.unwrap_or(TmuxServer::Default);
             sort_sessions(&mut sessions);
+            let buffers = load_buffers_from_servers(&active_servers);
             let mut state = TmuxState {
                 sessions,
+                buffers,
+                version,
                 notice: None,
                 diagnostics,
             };
@@ -329,6 +463,8 @@ impl TmuxClient {
             self.server = server;
             return Ok(TmuxState {
                 sessions: Vec::new(),
+                buffers: Vec::new(),
+                version,
                 notice: Some("No tmux sessions found. Press n to create a session.".into()),
                 diagnostics,
             });
@@ -337,6 +473,8 @@ impl TmuxClient {
         self.server = fallback_server;
         Ok(TmuxState {
             sessions: Vec::new(),
+            buffers: Vec::new(),
+            version,
             notice: Some(unreachable_server_notice()),
             diagnostics,
         })
@@ -408,6 +546,31 @@ impl TmuxClient {
         )
     }
 
+    pub fn create_window_with(
+        &self,
+        target: &TmuxTarget,
+        name: &str,
+        start_dir: Option<&str>,
+        command: Option<&str>,
+    ) -> Result<()> {
+        let mut args = vec![
+            "new-window".to_string(),
+            "-d".to_string(),
+            "-t".to_string(),
+            target.session_id.clone(),
+            "-n".to_string(),
+            name.to_string(),
+        ];
+        if let Some(start_dir) = start_dir.filter(|value| !value.trim().is_empty()) {
+            args.push("-c".into());
+            args.push(start_dir.to_string());
+        }
+        if let Some(command) = command.filter(|value| !value.trim().is_empty()) {
+            args.push(command.to_string());
+        }
+        run_tmux_owned_on(target.server(), &args)
+    }
+
     pub fn split_pane(&self, target: &TmuxTarget, direction: SplitDirection) -> Result<()> {
         let pane_id = target
             .pane_id
@@ -474,6 +637,133 @@ impl TmuxClient {
         run_tmux_on(target.server(), ["resize-pane", "-Z", "-t", pane_id])
     }
 
+    pub fn select_layout(&self, target: &TmuxTarget, layout: TmuxLayout) -> Result<()> {
+        let window_id = target
+            .window_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("tmux window target is missing"))?;
+        run_tmux_on(
+            target.server(),
+            ["select-layout", "-t", window_id, layout.tmux_name()],
+        )
+    }
+
+    pub fn toggle_sync_panes(&self, target: &TmuxTarget) -> Result<()> {
+        let window_id = target
+            .window_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("tmux window target is missing"))?;
+        run_tmux_on(
+            target.server(),
+            ["set-window-option", "-t", window_id, "synchronize-panes"],
+        )
+    }
+
+    pub fn rotate_window(&self, target: &TmuxTarget) -> Result<()> {
+        let window_id = target
+            .window_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("tmux window target is missing"))?;
+        run_tmux_on(target.server(), ["rotate-window", "-t", window_id])
+    }
+
+    pub fn swap_pane(&self, target: &TmuxTarget, next: bool) -> Result<()> {
+        let pane_id = target
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("tmux pane target is missing"))?;
+        let flag = if next { "-D" } else { "-U" };
+        run_tmux_on(target.server(), ["swap-pane", flag, "-t", pane_id])
+    }
+
+    pub fn swap_window(&self, target: &TmuxTarget, next: bool) -> Result<()> {
+        let window_id = target
+            .window_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("tmux window target is missing"))?;
+        let offset = if next { "+1" } else { "-1" };
+        run_tmux_on(
+            target.server(),
+            ["swap-window", "-d", "-s", window_id, "-t", offset],
+        )
+    }
+
+    pub fn break_pane(&self, target: &TmuxTarget) -> Result<()> {
+        let pane_id = target
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("tmux pane target is missing"))?;
+        run_tmux_on(target.server(), ["break-pane", "-d", "-s", pane_id])
+    }
+
+    pub fn join_pane(&self, source: &TmuxTarget, dest_target: &str) -> Result<()> {
+        let pane_id = source
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("tmux pane target is missing"))?;
+        run_tmux_on(
+            source.server(),
+            ["join-pane", "-s", pane_id, "-t", dest_target],
+        )
+    }
+
+    pub fn toggle_mark_pane(&self, target: &TmuxTarget, currently_marked: bool) -> Result<()> {
+        let pane_id = target
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("tmux pane target is missing"))?;
+        let flag = if currently_marked { "-M" } else { "-m" };
+        run_tmux_on(target.server(), ["select-pane", flag, "-t", pane_id])
+    }
+
+    pub fn swap_marked_pane(&self, target: &TmuxTarget) -> Result<()> {
+        let pane_id = target
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("tmux pane target is missing"))?;
+        run_tmux_on(target.server(), ["swap-pane", "-t", pane_id])
+    }
+
+    pub fn resize_pane(
+        &self,
+        target: &TmuxTarget,
+        direction: ResizeDirection,
+        amount: u16,
+    ) -> Result<()> {
+        let pane_id = target
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("tmux pane target is missing"))?;
+        let flag = match direction {
+            ResizeDirection::Left => "-L",
+            ResizeDirection::Right => "-R",
+            ResizeDirection::Up => "-U",
+            ResizeDirection::Down => "-D",
+        };
+        let amount_str = amount.to_string();
+        run_tmux_on(
+            target.server(),
+            ["resize-pane", "-t", pane_id, flag, amount_str.as_str()],
+        )
+    }
+
+    pub fn clear_pane(&self, target: &TmuxTarget) -> Result<()> {
+        let pane_id = target
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("tmux pane target is missing"))?;
+        run_tmux_on(target.server(), ["send-keys", "-t", pane_id, "C-l"])?;
+        run_tmux_on(target.server(), ["clear-history", "-t", pane_id])
+    }
+
+    pub fn respawn_pane(&self, target: &TmuxTarget) -> Result<()> {
+        let pane_id = target
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("tmux pane target is missing"))?;
+        run_tmux_on(target.server(), ["respawn-pane", "-k", "-t", pane_id])
+    }
+
     pub fn send_keys(&self, target: &TmuxTarget, keys: &str) -> Result<()> {
         let pane_id = target
             .pane_id
@@ -482,14 +772,79 @@ impl TmuxClient {
         run_tmux_on(target.server(), ["send-keys", "-t", pane_id, keys, "Enter"])
     }
 
+    pub fn broadcast_keys(&self, targets: &[TmuxTarget], keys: &str) -> Result<usize> {
+        let mut sent = 0usize;
+        for target in targets {
+            if let Some(pane_id) = target.pane_id.as_deref() {
+                run_tmux_on(target.server(), ["send-keys", "-t", pane_id, keys, "Enter"])?;
+                sent += 1;
+            }
+        }
+        Ok(sent)
+    }
+
     pub fn copy_pane_to_buffer(&self, target: &TmuxTarget) -> Result<()> {
         let pane_id = target
             .pane_id
             .as_deref()
             .ok_or_else(|| anyhow!("tmux pane target is missing"))?;
-        let content = capture_pane_content(target.server(), pane_id)?;
+        let content = capture_pane_plain(target.server(), pane_id)?;
         let args = vec!["set-buffer".to_string(), content];
         run_tmux_owned_on(target.server(), &args)
+    }
+
+    pub fn capture_pane_plain_text(&self, target: &TmuxTarget) -> Result<String> {
+        let pane_id = target
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("tmux pane target is missing"))?;
+        capture_pane_plain(target.server(), pane_id)
+    }
+
+    pub fn capture_pane_scrollback(&self, target: &TmuxTarget, lines: usize) -> Result<String> {
+        let pane_id = target
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("tmux pane target is missing"))?;
+        let start_arg = format!("-{lines}");
+        let output = tmux_output_on(
+            target.server(),
+            [
+                "capture-pane",
+                "-p",
+                "-S",
+                start_arg.as_str(),
+                "-t",
+                pane_id,
+            ],
+        )?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Ok(normalize_captured_content(&stdout))
+        } else {
+            Err(anyhow!(
+                "tmux capture-pane scrollback failed: {}",
+                output_message(&output)
+            ))
+        }
+    }
+
+    pub fn paste_buffer(&self, target: &TmuxTarget, buffer: &TmuxBuffer) -> Result<()> {
+        let pane_id = target
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("tmux pane target is missing"))?;
+        run_tmux_on(
+            &buffer.server,
+            ["paste-buffer", "-b", buffer.name.as_str(), "-t", pane_id],
+        )
+    }
+
+    pub fn delete_buffer(&self, buffer: &TmuxBuffer) -> Result<()> {
+        run_tmux_on(
+            &buffer.server,
+            ["delete-buffer", "-b", buffer.name.as_str()],
+        )
     }
 
     pub fn detach_client(&self) -> Result<()> {
@@ -523,6 +878,53 @@ impl TmuxClient {
             }
         }
     }
+}
+
+/// Copy plain text into the OS clipboard across macOS and Linux.
+pub fn copy_to_system_clipboard(text: &str) -> Result<&'static str> {
+    #[cfg(target_os = "macos")]
+    const CANDIDATES: &[(&str, &[&str])] = &[("pbcopy", &[])];
+
+    #[cfg(not(target_os = "macos"))]
+    const CANDIDATES: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+
+    let mut last_error = None;
+    for (program, args) in CANDIDATES {
+        match Command::new(program)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take() {
+                    if let Err(err) = stdin.write_all(text.as_bytes()) {
+                        last_error = Some(format!("{program}: {err}"));
+                        continue;
+                    }
+                }
+                match child.wait() {
+                    Ok(status) if status.success() => return Ok(*program),
+                    Ok(status) => last_error = Some(format!("{program} exited with {status}")),
+                    Err(err) => last_error = Some(format!("{program}: {err}")),
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => last_error = Some(format!("{program}: {err}")),
+        }
+    }
+
+    Err(anyhow!(
+        "{}",
+        last_error.unwrap_or_else(|| {
+            "no clipboard utility found (tried pbcopy / wl-copy / xclip / xsel)".into()
+        })
+    ))
 }
 
 enum ServerLoad {
@@ -561,6 +963,59 @@ fn load_state_from_server(server: &TmuxServer) -> Result<ServerLoad> {
     }
 }
 
+fn load_buffers_from_servers(servers: &[TmuxServer]) -> Vec<TmuxBuffer> {
+    let mut buffers = Vec::new();
+    let format =
+        format!("#{{buffer_name}}{PRIMARY_SEP}#{{buffer_size}}{PRIMARY_SEP}#{{buffer_sample}}");
+
+    for server in servers {
+        let Ok(output) = tmux_output_on(server, ["list-buffers", "-F", format.as_str()]) else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines().filter(|l| !l.trim().is_empty()).take(24) {
+            let parts: Vec<&str> = line.splitn(3, PRIMARY_SEP).collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let name = parts[0].to_string();
+            let size = parts[1].parse::<usize>().unwrap_or(0);
+            let sample = parts.get(2).copied().unwrap_or_default().to_string();
+            let content = tmux_output_on(server, ["show-buffer", "-b", name.as_str()])
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                .unwrap_or_else(|| sample.clone());
+
+            buffers.push(TmuxBuffer {
+                server: server.clone(),
+                name,
+                size,
+                sample,
+                content,
+            });
+        }
+    }
+
+    buffers
+}
+
+fn detect_tmux_version() -> Option<String> {
+    let output = Command::new("tmux").arg("-V").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 fn tmux_format(separator: char) -> String {
     let separator = separator.to_string();
     TMUX_FIELDS
@@ -591,9 +1046,14 @@ fn parse_list_panes(output: &str, server: TmuxServer, separator: char) -> TmuxSt
                 name: fields[1].to_string(),
                 attached: parse_bool(fields[2]),
                 created: fields[3].parse().ok(),
+                activity: fields.get(28).and_then(|v| v.parse().ok()),
                 window_count: fields[4].parse().ok(),
                 windows: Vec::new(),
             });
+
+        let window_zoomed = fields.get(25).copied().is_some_and(parse_bool);
+        let pane_synced = fields.get(26).copied().is_some_and(parse_bool);
+        let pane_marked = fields.get(27).copied().is_some_and(parse_bool);
 
         let window_index = session
             .windows
@@ -605,6 +1065,8 @@ fn parse_list_panes(output: &str, server: TmuxServer, separator: char) -> TmuxSt
                     index: fields[6].to_string(),
                     name: fields[7].to_string(),
                     active: parse_bool(fields[8]),
+                    zoomed: window_zoomed || fields[11].contains('Z'),
+                    synchronized: pane_synced,
                     pane_count: fields[9].parse().ok(),
                     layout: fields[10].to_string(),
                     flags: fields[11].to_string(),
@@ -614,11 +1076,19 @@ fn parse_list_panes(output: &str, server: TmuxServer, separator: char) -> TmuxSt
             });
 
         let window = &mut session.windows[window_index];
+        if pane_synced {
+            window.synchronized = true;
+        }
+        if window_zoomed {
+            window.zoomed = true;
+        }
+
         if !window.panes.iter().any(|pane| pane.id == pane_id) {
             window.panes.push(Pane {
                 id: pane_id,
                 index: fields[13].to_string(),
                 active: parse_bool(fields[14]),
+                marked: pane_marked,
                 command: fields[15].to_string(),
                 path: fields[16].to_string(),
                 title: fields[17].to_string(),
@@ -639,6 +1109,8 @@ fn parse_list_panes(output: &str, server: TmuxServer, separator: char) -> TmuxSt
 
     TmuxState {
         sessions,
+        buffers: Vec::new(),
+        version: None,
         notice: None,
         diagnostics: Vec::new(),
     }
@@ -1011,7 +1483,18 @@ fn run_tmux_owned_on(server: &TmuxServer, args: &[String]) -> Result<()> {
     }
 }
 
+/// Captures visible pane screen WITH ANSI color sequences (`-e`), falling back
+/// to plain capture if `-e` is unsupported.
 fn capture_pane_content(server: &TmuxServer, pane_id: &str) -> Result<String> {
+    let output = tmux_output_on(server, ["capture-pane", "-p", "-e", "-t", pane_id])?;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Ok(normalize_captured_content(&stdout));
+    }
+    capture_pane_plain(server, pane_id)
+}
+
+fn capture_pane_plain(server: &TmuxServer, pane_id: &str) -> Result<String> {
     let output = tmux_output_on(server, ["capture-pane", "-p", "-t", pane_id])?;
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1117,6 +1600,48 @@ mod tests {
         assert_eq!(state.sessions[0].windows.len(), 1);
         assert_eq!(state.sessions[0].windows[0].panes.len(), 1);
         assert_eq!(state.sessions[0].windows[0].panes[0].command, "nvim");
+    }
+
+    #[test]
+    fn parses_extended_flags_zoom_sync_marked() {
+        let row = [
+            "$1",
+            "dev",
+            "1",
+            "1700000000",
+            "1",
+            "@2",
+            "0",
+            "editor",
+            "1",
+            "1",
+            "tiled",
+            "*Z",
+            "%3",
+            "0",
+            "1",
+            "nvim",
+            "/tmp",
+            "title",
+            "0",
+            "0",
+            "120",
+            "40",
+            "123",
+            "0",
+            "0",
+            "1",
+            "1",
+            "1",
+            "1700000500",
+        ]
+        .join(&PRIMARY_SEP.to_string());
+
+        let state = parse_list_panes(&row, TmuxServer::Default, PRIMARY_SEP);
+        assert_eq!(state.sessions[0].activity, Some(1_700_000_500));
+        assert!(state.sessions[0].windows[0].zoomed);
+        assert!(state.sessions[0].windows[0].synchronized);
+        assert!(state.sessions[0].windows[0].panes[0].marked);
     }
 
     #[test]
